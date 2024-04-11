@@ -1,7 +1,8 @@
 package llb
 
 import (
-	_ "crypto/sha256"
+	"context"
+	_ "crypto/sha256" // for opencontainers/go-digest
 	"os"
 	"path"
 	"strconv"
@@ -47,14 +48,23 @@ func NewFileOp(s State, action *FileAction, c Constraints) *FileOp {
 }
 
 // CopyInput is either llb.State or *FileActionWithState
+// It is used by [Copy] to to specify the source of the copy operation.
 type CopyInput interface {
 	isFileOpCopyInput()
 }
 
 type subAction interface {
-	toProtoAction(string, pb.InputIndex) pb.IsFileAction
+	toProtoAction(context.Context, string, pb.InputIndex) (pb.IsFileAction, error)
 }
 
+type capAdder interface {
+	addCaps(*FileOp)
+}
+
+// FileAction is used to specify a file operation on a [State].
+// It can be used to create a directory, create a file, or remove a file, etc.
+// This is used by [State.File]
+// Typically a FileAction is created by calling one of the helper functions such as [Mkdir], [Copy], [Rm], [Mkfile]
 type FileAction struct {
 	state  *State
 	prev   *FileAction
@@ -86,24 +96,35 @@ func (fa *FileAction) Copy(input CopyInput, src, dest string, opt ...CopyOption)
 	return a
 }
 
-func (fa *FileAction) allOutputs(m map[Output]struct{}) {
+func (fa *FileAction) allOutputs(seen map[Output]struct{}, outputs []Output) []Output {
 	if fa == nil {
-		return
+		return outputs
 	}
-	if fa.state != nil && fa.state.Output() != nil {
-		m[fa.state.Output()] = struct{}{}
+
+	if fa.state != nil {
+		out := fa.state.Output()
+		if out != nil {
+			if _, ok := seen[out]; !ok {
+				outputs = append(outputs, out)
+				seen[out] = struct{}{}
+			}
+		}
 	}
 
 	if a, ok := fa.action.(*fileActionCopy); ok {
 		if a.state != nil {
-			if out := a.state.Output(); out != nil {
-				m[out] = struct{}{}
+			out := a.state.Output()
+			if out != nil {
+				if _, ok := seen[out]; !ok {
+					outputs = append(outputs, out)
+					seen[out] = struct{}{}
+				}
 			}
 		} else if a.fas != nil {
-			a.fas.allOutputs(m)
+			outputs = a.fas.allOutputs(seen, outputs)
 		}
 	}
-	fa.prev.allOutputs(m)
+	return fa.prev.allOutputs(seen, outputs)
 }
 
 func (fa *FileAction) bind(s State) *FileAction {
@@ -126,11 +147,16 @@ type fileActionWithState struct {
 
 func (fas *fileActionWithState) isFileOpCopyInput() {}
 
+// Mkdir creates a FileAction which creates a directory at the given path.
+// Example:
+//
+//	llb.Scratch().File(llb.Mkdir("/foo", 0755))
 func Mkdir(p string, m os.FileMode, opt ...MkdirOption) *FileAction {
 	var mi MkdirInfo
 	for _, o := range opt {
 		o.SetMkdirOption(&mi)
 	}
+
 	return &FileAction{
 		action: &fileActionMkdir{
 			file: p,
@@ -146,7 +172,7 @@ type fileActionMkdir struct {
 	info MkdirInfo
 }
 
-func (a *fileActionMkdir) toProtoAction(parent string, base pb.InputIndex) pb.IsFileAction {
+func (a *fileActionMkdir) toProtoAction(ctx context.Context, parent string, base pb.InputIndex) (pb.IsFileAction, error) {
 	return &pb.FileAction_Mkdir{
 		Mkdir: &pb.FileActionMkDir{
 			Path:        normalizePath(parent, a.file, false),
@@ -155,7 +181,7 @@ func (a *fileActionMkdir) toProtoAction(parent string, base pb.InputIndex) pb.Is
 			Owner:       a.info.ChownOpt.marshal(base),
 			Timestamp:   marshalTime(a.info.CreatedTime),
 		},
-	}
+	}, nil
 }
 
 type MkdirOption interface {
@@ -176,6 +202,7 @@ func (fn mkdirOptionFunc) SetMkdirOption(mi *MkdirInfo) {
 
 var _ MkdirOption = &MkdirInfo{}
 
+// WithParents is an option for Mkdir which creates parent directories if they do not exist.
 func WithParents(b bool) MkdirOption {
 	return mkdirOptionFunc(func(mi *MkdirInfo) {
 		mi.MakeParents = b
@@ -251,13 +278,13 @@ func (co ChownOpt) SetCopyOption(mi *CopyInfo) {
 	mi.ChownOpt = &co
 }
 
-func (cp *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
-	if cp == nil {
+func (co *ChownOpt) marshal(base pb.InputIndex) *pb.ChownOpt {
+	if co == nil {
 		return nil
 	}
 	return &pb.ChownOpt{
-		User:  cp.User.marshal(base),
-		Group: cp.Group.marshal(base),
+		User:  co.User.marshal(base),
+		Group: co.Group.marshal(base),
 	}
 }
 
@@ -277,6 +304,10 @@ func (up *UserOpt) marshal(base pb.InputIndex) *pb.UserOpt {
 	return &pb.UserOpt{User: &pb.UserOpt_ByID{ByID: uint32(up.UID)}}
 }
 
+// Mkfile creates a FileAction which creates a file at the given path with the provided contents.
+// Example:
+//
+//	llb.Scratch().File(llb.Mkfile("/foo", 0644, []byte("hello world!")))
 func Mkfile(p string, m os.FileMode, dt []byte, opts ...MkfileOption) *FileAction {
 	var mi MkfileInfo
 	for _, o := range opts {
@@ -315,7 +346,7 @@ type fileActionMkfile struct {
 	info MkfileInfo
 }
 
-func (a *fileActionMkfile) toProtoAction(parent string, base pb.InputIndex) pb.IsFileAction {
+func (a *fileActionMkfile) toProtoAction(ctx context.Context, parent string, base pb.InputIndex) (pb.IsFileAction, error) {
 	return &pb.FileAction_Mkfile{
 		Mkfile: &pb.FileActionMkFile{
 			Path:      normalizePath(parent, a.file, false),
@@ -324,9 +355,13 @@ func (a *fileActionMkfile) toProtoAction(parent string, base pb.InputIndex) pb.I
 			Owner:     a.info.ChownOpt.marshal(base),
 			Timestamp: marshalTime(a.info.CreatedTime),
 		},
-	}
+	}, nil
 }
 
+// Rm creates a FileAction which removes a file or directory at the given path.
+// Example:
+//
+//	llb.Scratch().File(Mkfile("/foo", 0644, []byte("not around for long..."))).File(llb.Rm("/foo"))
 func Rm(p string, opts ...RmOption) *FileAction {
 	var mi RmInfo
 	for _, o := range opts {
@@ -374,21 +409,52 @@ func WithAllowWildcard(b bool) RmOption {
 	})
 }
 
+type excludeOnCopyAction struct {
+	patterns []string
+}
+
+func (e *excludeOnCopyAction) SetCopyOption(i *CopyInfo) {
+	i.ExcludePatterns = append(i.ExcludePatterns, e.patterns...)
+}
+
+func WithExcludePatterns(patterns []string) CopyOption {
+	return &excludeOnCopyAction{patterns}
+}
+
 type fileActionRm struct {
 	file string
 	info RmInfo
 }
 
-func (a *fileActionRm) toProtoAction(parent string, base pb.InputIndex) pb.IsFileAction {
+func (a *fileActionRm) toProtoAction(ctx context.Context, parent string, base pb.InputIndex) (pb.IsFileAction, error) {
 	return &pb.FileAction_Rm{
 		Rm: &pb.FileActionRm{
 			Path:          normalizePath(parent, a.file, false),
 			AllowNotFound: a.info.AllowNotFound,
 			AllowWildcard: a.info.AllowWildcard,
 		},
-	}
+	}, nil
 }
 
+// Copy produces a FileAction which copies a file or directory from the source to the destination.
+// The "input" parameter is the contents to copy from.
+// "src" is the path to copy from within the "input".
+// "dest" is the path to copy to within the destination (the state being operated on).
+// See [CopyInput] for the valid types of input.
+//
+// Example:
+//
+//	st := llb.Local(".")
+//	llb.Scratch().File(llb.Copy(st, "/foo", "/bar"))
+//
+// The example copies the local (client) directory "./foo" to a new empty directory at /bar.
+//
+// Note: Copying directories can have different behavior based on if the destination exists or not.
+// When the destination already exists, the contents of the source directory is copied underneath the destination, including the directory itself.
+// You may need to supply a copy option to copy the dir contents only.
+// You may also need to pass in a [CopyOption] which creates parent directories if they do not exist.
+//
+// See [CopyOption] for more details on what options are available.
 func Copy(input CopyInput, src, dest string, opts ...CopyOption) *FileAction {
 	var state *State
 	var fas *fileActionWithState
@@ -405,7 +471,6 @@ func Copy(input CopyInput, src, dest string, opts ...CopyOption) *FileAction {
 	for _, o := range opts {
 		o.SetCopyOption(&mi)
 	}
-
 	return &FileAction{
 		action: &fileActionCopy{
 			state: state,
@@ -423,15 +488,18 @@ type CopyOption interface {
 }
 
 type CopyInfo struct {
-	Mode                *os.FileMode
-	FollowSymlinks      bool
-	CopyDirContentsOnly bool
-	AttemptUnpack       bool
-	CreateDestPath      bool
-	AllowWildcard       bool
-	AllowEmptyWildcard  bool
-	ChownOpt            *ChownOpt
-	CreatedTime         *time.Time
+	Mode                           *os.FileMode
+	FollowSymlinks                 bool
+	CopyDirContentsOnly            bool
+	IncludePatterns                []string
+	ExcludePatterns                []string
+	AttemptUnpack                  bool
+	CreateDestPath                 bool
+	AllowWildcard                  bool
+	AllowEmptyWildcard             bool
+	ChownOpt                       *ChownOpt
+	CreatedTime                    *time.Time
+	AlwaysReplaceExistingDestPaths bool
 }
 
 func (mi *CopyInfo) SetCopyOption(mi2 *CopyInfo) {
@@ -448,11 +516,17 @@ type fileActionCopy struct {
 	info  CopyInfo
 }
 
-func (a *fileActionCopy) toProtoAction(parent string, base pb.InputIndex) pb.IsFileAction {
+func (a *fileActionCopy) toProtoAction(ctx context.Context, parent string, base pb.InputIndex) (pb.IsFileAction, error) {
+	src, err := a.sourcePath(ctx)
+	if err != nil {
+		return nil, err
+	}
 	c := &pb.FileActionCopy{
-		Src:                              a.sourcePath(),
+		Src:                              src,
 		Dest:                             normalizePath(parent, a.dest, true),
 		Owner:                            a.info.ChownOpt.marshal(base),
+		IncludePatterns:                  a.info.IncludePatterns,
+		ExcludePatterns:                  a.info.ExcludePatterns,
 		AllowWildcard:                    a.info.AllowWildcard,
 		AllowEmptyWildcard:               a.info.AllowEmptyWildcard,
 		FollowSymlink:                    a.info.FollowSymlinks,
@@ -460,6 +534,7 @@ func (a *fileActionCopy) toProtoAction(parent string, base pb.InputIndex) pb.IsF
 		AttemptUnpackDockerCompatibility: a.info.AttemptUnpack,
 		CreateDestPath:                   a.info.CreateDestPath,
 		Timestamp:                        marshalTime(a.info.CreatedTime),
+		AlwaysReplaceExistingDestPaths:   a.info.AlwaysReplaceExistingDestPaths,
 	}
 	if a.info.Mode != nil {
 		c.Mode = int32(*a.info.Mode)
@@ -468,19 +543,33 @@ func (a *fileActionCopy) toProtoAction(parent string, base pb.InputIndex) pb.IsF
 	}
 	return &pb.FileAction_Copy{
 		Copy: c,
-	}
+	}, nil
 }
 
-func (c *fileActionCopy) sourcePath() string {
-	p := path.Clean(c.src)
+func (a *fileActionCopy) sourcePath(ctx context.Context) (string, error) {
+	p := path.Clean(a.src)
+	dir := "/"
+	var err error
 	if !path.IsAbs(p) {
-		if c.state != nil {
-			p = path.Join("/", c.state.GetDir(), p)
-		} else if c.fas != nil {
-			p = path.Join("/", c.fas.state.GetDir(), p)
+		if a.state != nil {
+			dir, err = a.state.GetDir(ctx)
+		} else if a.fas != nil {
+			dir, err = a.fas.state.GetDir(ctx)
+		}
+		if err != nil {
+			return "", err
 		}
 	}
-	return p
+	return path.Join(dir, p), nil
+}
+
+func (a *fileActionCopy) addCaps(f *FileOp) {
+	if len(a.info.IncludePatterns) != 0 || len(a.info.ExcludePatterns) != 0 {
+		addCap(&f.constraints, pb.CapFileCopyIncludeExcludePatterns)
+	}
+	if a.info.AlwaysReplaceExistingDestPaths {
+		addCap(&f.constraints, pb.CapFileCopyAlwaysReplaceExistingDestPaths)
+	}
 }
 
 type CreatedTime time.Time
@@ -517,7 +606,7 @@ type FileOp struct {
 	isValidated bool
 }
 
-func (f *FileOp) Validate() error {
+func (f *FileOp) Validate(context.Context, *Constraints) error {
 	if f.isValidated {
 		return nil
 	}
@@ -529,14 +618,16 @@ func (f *FileOp) Validate() error {
 }
 
 type marshalState struct {
+	ctx     context.Context
 	visited map[*FileAction]*fileActionState
 	inputs  []*pb.Input
 	actions []*fileActionState
 }
 
-func newMarshalState() *marshalState {
+func newMarshalState(ctx context.Context) *marshalState {
 	return &marshalState{
 		visited: map[*FileAction]*fileActionState{},
+		ctx:     ctx,
 	}
 }
 
@@ -552,7 +643,7 @@ type fileActionState struct {
 }
 
 func (ms *marshalState) addInput(st *fileActionState, c *Constraints, o Output) (pb.InputIndex, error) {
-	inp, err := o.ToInput(c)
+	inp, err := o.ToInput(ms.ctx, c)
 	if err != nil {
 		return 0, err
 	}
@@ -634,54 +725,77 @@ func (ms *marshalState) add(fa *FileAction, c *Constraints) (*fileActionState, e
 	return st, nil
 }
 
-func (f *FileOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, error) {
+func (f *FileOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
 	if f.Cached(c) {
 		return f.Load()
 	}
-	if err := f.Validate(); err != nil {
-		return "", nil, nil, err
+	if err := f.Validate(ctx, c); err != nil {
+		return "", nil, nil, nil, err
 	}
 
 	addCap(&f.constraints, pb.CapFileBase)
 
 	pfo := &pb.FileOp{}
 
+	if f.constraints.Platform == nil {
+		p, err := getPlatform(*f.action.state)(ctx, c)
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+		f.constraints.Platform = p
+	}
+
+	state := newMarshalState(ctx)
+	for _, st := range state.actions {
+		if adder, isCapAdder := st.action.(capAdder); isCapAdder {
+			adder.addCaps(f)
+		}
+	}
+
 	pop, md := MarshalConstraints(c, &f.constraints)
+	pop.Platform = nil // file op is not platform specific
 	pop.Op = &pb.Op_File{
 		File: pfo,
 	}
 
-	state := newMarshalState()
 	_, err := state.add(f.action, c)
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
 	pop.Inputs = state.inputs
 
 	for i, st := range state.actions {
-		output := pb.OutputIndex(-1)
+		output := pb.SkipOutput
 		if i+1 == len(state.actions) {
 			output = 0
 		}
 
 		var parent string
 		if st.fa.state != nil {
-			parent = st.fa.state.GetDir()
+			parent, err = st.fa.state.GetDir(ctx)
+			if err != nil {
+				return "", nil, nil, nil, err
+			}
+		}
+
+		action, err := st.action.toProtoAction(ctx, parent, st.base)
+		if err != nil {
+			return "", nil, nil, nil, err
 		}
 
 		pfo.Actions = append(pfo.Actions, &pb.FileAction{
 			Input:          getIndex(st.input, len(state.inputs), st.inputRelative),
 			SecondaryInput: getIndex(st.input2, len(state.inputs), st.input2Relative),
 			Output:         output,
-			Action:         st.action.toProtoAction(parent, st.base),
+			Action:         action,
 		})
 	}
 
 	dt, err := pop.Marshal()
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
-	f.Store(dt, md, c)
+	f.Store(dt, md, f.constraints.SourceLocations, c)
 	return f.Load()
 }
 
@@ -708,15 +822,8 @@ func (f *FileOp) Output() Output {
 	return f.output
 }
 
-func (f *FileOp) Inputs() (inputs []Output) {
-	mm := map[Output]struct{}{}
-
-	f.action.allOutputs(mm)
-
-	for o := range mm {
-		inputs = append(inputs, o)
-	}
-	return inputs
+func (f *FileOp) Inputs() []Output {
+	return f.action.allOutputs(map[Output]struct{}{}, []Output{})
 }
 
 func getIndex(input pb.InputIndex, len int, relative *int) pb.InputIndex {

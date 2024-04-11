@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,30 +9,45 @@ import (
 
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli-plugins/manager"
+	"github.com/docker/cli/cli-plugins/socket"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/connhelper"
+	"github.com/docker/cli/cli/debug"
 	"github.com/docker/docker/client"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel"
 )
 
 // PersistentPreRunE must be called by any plugin command (or
 // subcommand) which uses the cobra `PersistentPreRun*` hook. Plugins
 // which do not make use of `PersistentPreRun*` do not need to call
 // this (although it remains safe to do so). Plugins are recommended
-// to use `PersistenPreRunE` to enable the error to be
+// to use `PersistentPreRunE` to enable the error to be
 // returned. Should not be called outside of a command's
 // PersistentPreRunE hook and must not be run unless Run has been
 // called.
 var PersistentPreRunE func(*cobra.Command, []string) error
 
-func runPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager.Metadata) error {
+// RunPlugin executes the specified plugin command
+func RunPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager.Metadata) error {
 	tcmd := newPluginCommand(dockerCli, plugin, meta)
 
 	var persistentPreRunOnce sync.Once
-	PersistentPreRunE = func(_ *cobra.Command, _ []string) error {
+	PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		var err error
 		persistentPreRunOnce.Do(func() {
-			var opts []command.InitializeOpt
+			cmdContext := cmd.Context()
+			// TODO: revisit and make sure this check makes sense
+			// see: https://github.com/docker/cli/pull/4599#discussion_r1422487271
+			if cmdContext == nil {
+				cmdContext = context.TODO()
+			}
+			ctx, cancel := context.WithCancel(cmdContext)
+			cmd.SetContext(ctx)
+			// Set up the context to cancel based on signalling via CLI socket.
+			socket.ConnectAndWait(cancel)
+
+			var opts []command.CLIOption
 			if os.Getenv("DOCKER_CLI_PLUGIN_USE_DIAL_STDIO") != "" {
 				opts = append(opts, withPluginClientConn(plugin.Name()))
 			}
@@ -40,15 +56,20 @@ func runPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager
 		return err
 	}
 
-	cmd, _, err := tcmd.HandleGlobalFlags()
+	cmd, args, err := tcmd.HandleGlobalFlags()
 	if err != nil {
 		return err
 	}
+	// We've parsed global args already, so reset args to those
+	// which remain.
+	cmd.SetArgs(args)
 	return cmd.Execute()
 }
 
 // Run is the top-level entry point to the CLI plugin framework. It should be called from your plugin's `main()` function.
 func Run(makeCmd func(command.Cli) *cobra.Command, meta manager.Metadata) {
+	otel.SetErrorHandler(debug.OTELErrorHandler)
+
 	dockerCli, err := command.NewDockerCli()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -57,7 +78,7 @@ func Run(makeCmd func(command.Cli) *cobra.Command, meta manager.Metadata) {
 
 	plugin := makeCmd(dockerCli)
 
-	if err := runPlugin(dockerCli, plugin, meta); err != nil {
+	if err := RunPlugin(dockerCli, plugin, meta); err != nil {
 		if sterr, ok := err.(cli.StatusError); ok {
 			if sterr.Status != "" {
 				fmt.Fprintln(dockerCli.Err(), sterr.Status)
@@ -74,7 +95,7 @@ func Run(makeCmd func(command.Cli) *cobra.Command, meta manager.Metadata) {
 	}
 }
 
-func withPluginClientConn(name string) command.InitializeOpt {
+func withPluginClientConn(name string) command.CLIOption {
 	return command.WithInitializeClient(func(dockerCli *command.DockerCli) (client.APIClient, error) {
 		cmd := "docker"
 		if x := os.Getenv(manager.ReexecEnvvar); x != "" {
@@ -111,17 +132,27 @@ func newPluginCommand(dockerCli *command.DockerCli, plugin *cobra.Command, meta 
 	fullname := manager.NamePrefix + name
 
 	cmd := &cobra.Command{
-		Use:                   fmt.Sprintf("docker [OPTIONS] %s [ARG...]", name),
-		Short:                 fullname + " is a Docker CLI plugin",
-		SilenceUsage:          true,
-		SilenceErrors:         true,
-		PersistentPreRunE:     PersistentPreRunE,
+		Use:           fmt.Sprintf("docker [OPTIONS] %s [ARG...]", name),
+		Short:         fullname + " is a Docker CLI plugin",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// We can't use this as the hook directly since it is initialised later (in runPlugin)
+			return PersistentPreRunE(cmd, args)
+		},
 		TraverseChildren:      true,
 		DisableFlagsInUseLine: true,
+		CompletionOptions: cobra.CompletionOptions{
+			DisableDefaultCmd:   false,
+			HiddenDefaultCmd:    true,
+			DisableDescriptions: true,
+		},
 	}
-	opts, flags := cli.SetupPluginRootCommand(cmd)
+	opts, _ := cli.SetupPluginRootCommand(cmd)
 
-	cmd.SetOutput(dockerCli.Out())
+	cmd.SetIn(dockerCli.In())
+	cmd.SetOut(dockerCli.Out())
+	cmd.SetErr(dockerCli.Err())
 
 	cmd.AddCommand(
 		plugin,
@@ -130,7 +161,7 @@ func newPluginCommand(dockerCli *command.DockerCli, plugin *cobra.Command, meta 
 
 	cli.DisableFlagsInUseLine(cmd)
 
-	return cli.NewTopLevelCommand(cmd, dockerCli, opts, flags)
+	return cli.NewTopLevelCommand(cmd, dockerCli, opts, cmd.Flags())
 }
 
 func newMetadataSubcommand(plugin *cobra.Command, meta manager.Metadata) *cobra.Command {
@@ -152,4 +183,12 @@ func newMetadataSubcommand(plugin *cobra.Command, meta manager.Metadata) *cobra.
 		},
 	}
 	return cmd
+}
+
+// RunningStandalone tells a CLI plugin it is run standalone by direct execution
+func RunningStandalone() bool {
+	if os.Getenv(manager.ReexecEnvvar) != "" {
+		return false
+	}
+	return len(os.Args) < 2 || os.Args[1] != manager.MetadataSubcommandName
 }

@@ -3,9 +3,9 @@ package docker
 import (
 	"context"
 
+	"github.com/docker/buildx/driver"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/pkg/errors"
-	"github.com/tonistiigi/buildx/driver"
 )
 
 const prioritySupported = 10
@@ -26,12 +26,12 @@ func (*factory) Usage() string {
 	return "docker"
 }
 
-func (*factory) Priority(ctx context.Context, api dockerclient.APIClient) int {
+func (*factory) Priority(ctx context.Context, endpoint string, api dockerclient.APIClient, dialMeta map[string][]string) int {
 	if api == nil {
 		return priorityUnsupported
 	}
 
-	c, err := api.DialHijack(ctx, "/grpc", "h2c", nil)
+	c, err := api.DialHijack(ctx, "/grpc", "h2c", dialMeta)
 	if err != nil {
 		return priorityUnsupported
 	}
@@ -44,13 +44,11 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	if cfg.DockerAPI == nil {
 		return nil, errors.Errorf("docker driver requires docker API access")
 	}
-
-	v, err := cfg.DockerAPI.ServerVersion(ctx)
-	if err != nil {
-		return nil, errors.Wrapf(driver.ErrNotConnecting, err.Error())
+	if len(cfg.Files) > 0 {
+		return nil, errors.Errorf("setting config file is not supported for docker driver, use dockerd configuration file")
 	}
 
-	return &Driver{factory: f, InitConfig: cfg, version: v}, nil
+	return &Driver{factory: f, InitConfig: cfg}, nil
 }
 
 func (f *factory) AllowsInstances() bool {

@@ -1,4 +1,5 @@
-// +build linux darwin freebsd solaris
+//go:build !windows
+// +build !windows
 
 /*
    Copyright The containerd Authors.
@@ -48,5 +49,6 @@ func newHardlinkKey(fi os.FileInfo) (hardlinkKey, error) {
 		return hardlinkKey{}, errNotAHardLink
 	}
 
+	//nolint:unconvert
 	return hardlinkKey{dev: uint64(sys.Dev), inode: uint64(sys.Ino)}, nil
 }

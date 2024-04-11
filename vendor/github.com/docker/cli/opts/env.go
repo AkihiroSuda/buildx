@@ -1,46 +1,31 @@
 package opts
 
 import (
-	"fmt"
 	"os"
-	"runtime"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // ValidateEnv validates an environment variable and returns it.
-// If no value is specified, it returns the current value using os.Getenv.
+// If no value is specified, it obtains its value from the current environment
 //
 // As on ParseEnvFile and related to #16585, environment variable names
-// are not validate what so ever, it's up to application inside docker
+// are not validated, and it's up to the application inside the container
 // to validate them or not.
 //
 // The only validation here is to check if name is empty, per #25099
 func ValidateEnv(val string) (string, error) {
-	arr := strings.Split(val, "=")
-	if arr[0] == "" {
-		return "", fmt.Errorf("invalid environment variable: %s", val)
+	k, _, hasValue := strings.Cut(val, "=")
+	if k == "" {
+		return "", errors.New("invalid environment variable: " + val)
 	}
-	if len(arr) > 1 {
+	if hasValue {
+		// val contains a "=" (but value may be an empty string)
 		return val, nil
 	}
-	if !doesEnvExist(val) {
-		return val, nil
+	if envVal, ok := os.LookupEnv(k); ok {
+		return k + "=" + envVal, nil
 	}
-	return fmt.Sprintf("%s=%s", val, os.Getenv(val)), nil
-}
-
-func doesEnvExist(name string) bool {
-	for _, entry := range os.Environ() {
-		parts := strings.SplitN(entry, "=", 2)
-		if runtime.GOOS == "windows" {
-			// Environment variable are case-insensitive on Windows. PaTh, path and PATH are equivalent.
-			if strings.EqualFold(parts[0], name) {
-				return true
-			}
-		}
-		if parts[0] == name {
-			return true
-		}
-	}
-	return false
+	return val, nil
 }

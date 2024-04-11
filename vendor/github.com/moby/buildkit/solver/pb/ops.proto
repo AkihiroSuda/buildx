@@ -10,6 +10,7 @@ option (gogoproto.stable_marshaler_all) = true;
 
 // Op represents a vertex of the LLB DAG.
 message Op {
+	// changes to this structure must be represented in json.go.
 	// inputs is a set of input edges.
 	repeated Input inputs = 1;
 	oneof op {
@@ -17,6 +18,8 @@ message Op {
 		SourceOp source = 3;
 		FileOp file = 4;
 		BuildOp build = 5;
+		MergeOp merge = 6;
+		DiffOp diff = 7;
 	}
 	Platform platform = 10;
 	WorkerConstraints constraints = 11;
@@ -27,7 +30,7 @@ message Platform {
 	string Architecture = 1;
 	string OS = 2;
 	string Variant = 3;
-	string OSVersion = 4; // unused
+	string OSVersion = 4;
 	repeated string OSFeatures = 5; // unused
 }
 
@@ -45,6 +48,7 @@ message ExecOp {
 	repeated Mount mounts = 2;
 	NetMode network = 3;
 	SecurityMode security = 4;
+	repeated SecretEnv secretenv = 5;
 }
 
 // Meta is a set of arguments for ExecOp.
@@ -57,6 +61,21 @@ message Meta {
 	string user = 4;
 	ProxyEnv proxy_env = 5;
 	repeated HostIP extraHosts = 6;
+	string hostname = 7;
+	repeated Ulimit ulimit = 9;
+	string cgroupParent = 10;
+	bool removeMountStubsRecursive = 11;
+}
+
+message HostIP {
+	string Host = 1;
+	string IP = 2;
+}
+
+message Ulimit {
+	string Name = 1;
+	int64 Soft = 2;
+	int64 Hard = 3;
 }
 
 enum NetMode {
@@ -70,6 +89,13 @@ enum SecurityMode {
 	INSECURE = 1; // privileged mode
 }
 
+// SecretEnv is an environment variable that is backed by a secret.
+message SecretEnv {
+	string ID = 1;
+	string name = 2;
+	bool optional = 3;
+}
+
 // Mount specifies how to mount an input Op as a filesystem.
 message Mount {
 	int64 input = 1 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false];
@@ -78,9 +104,12 @@ message Mount {
 	int64 output = 4 [(gogoproto.customtype) = "OutputIndex", (gogoproto.nullable) = false];
 	bool readonly = 5;
 	MountType mountType = 6;
+	TmpfsOpt TmpfsOpt = 19;
 	CacheOpt cacheOpt = 20;
 	SecretOpt secretOpt = 21;
 	SSHOpt SSHOpt = 22;
+	string resultID = 23;
+	MountContentCache contentCache = 24;
 }
 
 // MountType defines a type of a mount from a supported set
@@ -92,11 +121,24 @@ enum MountType {
 	TMPFS = 4;
 }
 
+// MountContentCache ...
+enum MountContentCache {
+	DEFAULT = 0;
+	ON = 1;
+	OFF = 2;
+}
+
+// TmpfsOpt defines options describing tpmfs mounts
+message TmpfsOpt {
+	// Specify an upper limit on the size of the filesystem.
+	int64 size = 1;
+}
+
 // CacheOpt defines options specific to cache mounts
 message CacheOpt {
 	// ID is an optional namespace for the mount
 	string ID = 1;
-	// Sharing is the sharing mode for the mount 
+	// Sharing is the sharing mode for the mount
 	CacheSharingOpt sharing = 2;
 }
 
@@ -125,7 +167,7 @@ message SecretOpt {
 	bool optional = 5;
 }
 
-// SSHOpt defines options describing secret mounts
+// SSHOpt defines options describing ssh mounts
 message SSHOpt {
 	// ID of exposed ssh rule. Used for quering the value.
 	string ID = 1;
@@ -169,16 +211,61 @@ message OpMetadata {
 	// ignore_cache specifies to ignore the cache for this Op.
 	bool ignore_cache = 1;
 	// Description can be used for keeping any text fields that builder doesn't parse
-	map<string, string> description = 2; 
+	map<string, string> description = 2;
 	// index 3 reserved for WorkerConstraint in previous versions
 	// WorkerConstraint worker_constraint = 3;
 	ExportCache export_cache = 4;
-	
+
 	map<string, bool> caps = 5 [(gogoproto.castkey) = "github.com/moby/buildkit/util/apicaps.CapID", (gogoproto.nullable) = false];
+
+	ProgressGroup progress_group = 6;
+}
+
+// Source is a source mapping description for a file
+message Source {
+	map<string, Locations> locations = 1;
+	repeated SourceInfo infos = 2;
+}
+
+// Locations is a list of ranges with a index to its source map.
+message Locations {
+	repeated Location locations = 1;
+}
+
+// Source info contains the shared metadata of a source mapping
+message SourceInfo {
+	string filename = 1;
+	bytes data = 2;
+	Definition definition = 3;
+	string language = 4;
+}
+
+// Location defines list of areas in to source file
+message Location {
+	int32 sourceIndex = 1;
+	repeated Range ranges = 2;
+}
+
+// Range is an area in the source file
+message Range {
+	Position start = 1 [(gogoproto.nullable) = false];
+	Position end = 2 [(gogoproto.nullable) = false];
+}
+
+// Position is single location in a source file
+message Position {
+	int32 line = 1;
+	int32 character = 2;
 }
 
 message ExportCache {
 	bool Value = 1;
+}
+
+message ProgressGroup {
+	string id = 1;
+	string name = 2;
+	bool weak = 3;
 }
 
 message ProxyEnv {
@@ -186,6 +273,7 @@ message ProxyEnv {
 	string https_proxy = 2;
 	string ftp_proxy = 3;
 	string no_proxy = 4;
+	string all_proxy = 5;
 }
 
 // WorkerConstraints defines conditions for the worker
@@ -200,11 +288,8 @@ message Definition {
 	// metadata contains metadata for the each of the Op messages.
 	// A key must be an LLB op digest string. Currently, empty string is not expected as a key, but it may change in the future.
 	map<string, OpMetadata> metadata = 2 [(gogoproto.castkey) = "github.com/opencontainers/go-digest.Digest", (gogoproto.nullable) = false];
-}
-
-message HostIP {
-	string Host = 1;
-	string IP = 2;
+	// Source contains the source mapping information for the vertexes in the definition
+	Source Source = 3;
 }
 
 message FileOp {
@@ -212,6 +297,7 @@ message FileOp {
 }
 
 message FileAction {
+	// changes to this structure must be represented in json.go.
 	int64 input = 1 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false]; // could be real input or target (target index + max input index)
 	int64 secondaryInput = 2 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false]; // --//--
 	int64 output = 3 [(gogoproto.customtype) = "OutputIndex", (gogoproto.nullable) = false];
@@ -250,6 +336,12 @@ message FileActionCopy {
 	bool allowEmptyWildcard = 10;
 	// optional created time override
 	int64 timestamp = 11;
+	// include only files/dirs matching at least one of these patterns
+	repeated string include_patterns = 12;
+	// exclude files/dir matching any of these patterns (even if they match an include pattern)
+	repeated string exclude_patterns = 13;
+	// alwaysReplaceExistingDestPaths results in an existing dest path that differs in type from the src path being replaced rather than the default of returning an error
+	bool alwaysReplaceExistingDestPaths = 14;
 }
 
 message FileActionMkFile {
@@ -293,6 +385,7 @@ message ChownOpt {
 }
 
 message UserOpt {
+	// changes to this structure must be represented in json.go.
 	oneof user {
 		NamedUserOpt byName = 1;
 		uint32 byID = 2;
@@ -302,4 +395,25 @@ message UserOpt {
 message NamedUserOpt {
 	string name = 1;
 	int64 input = 2 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false];
+}
+
+message MergeInput {
+	int64 input = 1 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false];
+}
+
+message MergeOp {
+	repeated MergeInput inputs = 1;
+}
+
+message LowerDiffInput {
+	int64 input = 1 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false];
+}
+
+message UpperDiffInput {
+	int64 input = 1 [(gogoproto.customtype) = "InputIndex", (gogoproto.nullable) = false];
+}
+
+message DiffOp {
+	LowerDiffInput lower = 1;
+	UpperDiffInput upper = 2;
 }

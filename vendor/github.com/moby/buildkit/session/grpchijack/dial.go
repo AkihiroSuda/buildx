@@ -16,11 +16,8 @@ import (
 
 func Dialer(api controlapi.ControlClient) session.Dialer {
 	return func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
-
 		meta = lowerHeaders(meta)
-
 		md := metadata.MD(meta)
-
 		ctx = metadata.NewOutgoingContext(ctx, md)
 
 		stream, err := api.Session(ctx)
@@ -33,20 +30,26 @@ func Dialer(api controlapi.ControlClient) session.Dialer {
 	}
 }
 
-func streamToConn(stream grpc.Stream) (net.Conn, <-chan struct{}) {
+type stream interface {
+	Context() context.Context
+	SendMsg(m interface{}) error
+	RecvMsg(m interface{}) error
+}
+
+func streamToConn(stream stream) (net.Conn, <-chan struct{}) {
 	closeCh := make(chan struct{})
 	c := &conn{stream: stream, buf: make([]byte, 32*1<<10), closeCh: closeCh}
 	return c, closeCh
 }
 
 type conn struct {
-	stream  grpc.Stream
+	stream  stream
 	buf     []byte
 	lastBuf []byte
 
 	closedOnce sync.Once
 	readMu     sync.Mutex
-	err        error
+	writeMu    sync.Mutex
 	closeCh    chan struct{}
 }
 
@@ -79,6 +82,8 @@ func (c *conn) Read(b []byte) (n int, err error) {
 }
 
 func (c *conn) Write(b []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	m := &controlapi.BytesMessage{Data: b}
 	if err := c.stream.SendMsg(m); err != nil {
 		return 0, err
@@ -93,7 +98,9 @@ func (c *conn) Close() (err error) {
 		}()
 
 		if cs, ok := c.stream.(grpc.ClientStream); ok {
+			c.writeMu.Lock()
 			err = cs.CloseSend()
+			c.writeMu.Unlock()
 			if err != nil {
 				return
 			}
@@ -106,6 +113,7 @@ func (c *conn) Close() (err error) {
 			err = c.stream.RecvMsg(m)
 			if err != nil {
 				if err != io.EOF {
+					c.readMu.Unlock()
 					return
 				}
 				err = nil
@@ -115,7 +123,6 @@ func (c *conn) Close() (err error) {
 			c.lastBuf = append(c.lastBuf, c.buf...)
 		}
 		c.readMu.Unlock()
-
 	})
 	return nil
 }

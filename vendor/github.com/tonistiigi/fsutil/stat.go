@@ -19,7 +19,7 @@ func mkstat(path, relpath string, fi os.FileInfo, inodemap map[uint64]string) (*
 	relpath = filepath.ToSlash(relpath)
 
 	stat := &types.Stat{
-		Path:    relpath,
+		Path:    filepath.FromSlash(relpath),
 		Mode:    uint32(fi.Mode()),
 		ModTime: fi.ModTime().UnixNano(),
 	}
@@ -31,13 +31,13 @@ func mkstat(path, relpath string, fi os.FileInfo, inodemap map[uint64]string) (*
 		if fi.Mode()&os.ModeSymlink != 0 {
 			link, err := os.Readlink(path)
 			if err != nil {
-				return nil, errors.Wrapf(err, "failed to readlink %s", path)
+				return nil, errors.WithStack(err)
 			}
 			stat.Linkname = link
 		}
 	}
 	if err := loadXattr(path, stat); err != nil {
-		return nil, errors.Wrapf(err, "failed to xattr %s", relpath)
+		return nil, err
 	}
 
 	if runtime.GOOS == "windows" {
@@ -49,13 +49,16 @@ func mkstat(path, relpath string, fi os.FileInfo, inodemap map[uint64]string) (*
 		stat.Mode = noPermPart | permPart
 	}
 
+	// Clear the socket bit since archive/tar.FileInfoHeader does not handle it
+	stat.Mode &^= uint32(os.ModeSocket)
+
 	return stat, nil
 }
 
 func Stat(path string) (*types.Stat, error) {
 	fi, err := os.Lstat(path)
 	if err != nil {
-		return nil, errors.Wrap(err, "os stat")
+		return nil, errors.WithStack(err)
 	}
 	return mkstat(path, filepath.Base(path), fi, nil)
 }

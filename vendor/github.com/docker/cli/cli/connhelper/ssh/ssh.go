@@ -30,9 +30,7 @@ func ParseURL(daemonURL string) (*Spec, error) {
 		return nil, errors.Errorf("no host specified")
 	}
 	sp.Port = u.Port()
-	if u.Path != "" {
-		return nil, errors.Errorf("extra path after the host: %q", u.Path)
-	}
+	sp.Path = u.Path
 	if u.RawQuery != "" {
 		return nil, errors.Errorf("extra query after the host: %q", u.RawQuery)
 	}
@@ -47,10 +45,11 @@ type Spec struct {
 	User string
 	Host string
 	Port string
+	Path string
 }
 
-// Args returns args except "ssh" itself and "-- ..."
-func (sp *Spec) Args() []string {
+// Args returns args except "ssh" itself combined with optional additional command args
+func (sp *Spec) Args(add ...string) []string {
 	var args []string
 	if sp.User != "" {
 		args = append(args, "-l", sp.User)
@@ -58,6 +57,7 @@ func (sp *Spec) Args() []string {
 	if sp.Port != "" {
 		args = append(args, "-p", sp.Port)
 	}
-	args = append(args, sp.Host)
+	args = append(args, "--", sp.Host)
+	args = append(args, add...)
 	return args
 }

@@ -43,7 +43,7 @@ func WhiteList(allowed, supported []Entitlement) (Set, error) {
 		}
 		if supported != nil {
 			if !supm.Allowed(e) {
-				return nil, errors.Errorf("entitlement %s is not allowed", e)
+				return nil, errors.Errorf("granting entitlement %s is not allowed by build daemon configuration", e)
 			}
 		}
 		m[e] = struct{}{}
@@ -57,4 +57,24 @@ type Set map[Entitlement]struct{}
 func (s Set) Allowed(e Entitlement) bool {
 	_, ok := s[e]
 	return ok
+}
+
+func (s Set) Check(v Values) error {
+	if v.NetworkHost {
+		if !s.Allowed(EntitlementNetworkHost) {
+			return errors.Errorf("%s is not allowed", EntitlementNetworkHost)
+		}
+	}
+
+	if v.SecurityInsecure {
+		if !s.Allowed(EntitlementSecurityInsecure) {
+			return errors.Errorf("%s is not allowed", EntitlementSecurityInsecure)
+		}
+	}
+	return nil
+}
+
+type Values struct {
+	NetworkHost      bool
+	SecurityInsecure bool
 }

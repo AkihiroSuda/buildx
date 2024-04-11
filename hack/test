@@ -1,53 +1,36 @@
 #!/usr/bin/env bash
 
-. $(dirname $0)/util
 set -eu -o pipefail
 
-: ${CONTINUOUS_INTEGRATION=}
-: ${BUILDX_NOCACHE=}
+: "${BUILDX_CMD=docker buildx}"
 
-progressFlag=""
-if [ "$CONTINUOUS_INTEGRATION" == "true" ]; then progressFlag="--progress=plain"; fi
+: "${TEST_IMAGE_BUILD=1}"
+: "${TEST_IMAGE_ID=buildx-tests}"
 
-iid="buildx-tests"
-iidfile=$(mktemp -t docker-iidfile.XXXXXXXXXX)
-set -x
+: "${TEST_REPORT_SUFFIX=}"
+: "${TEST_KEEP_CACHE=}"
+: "${TEST_DOCKERD=}"
+: "${TEST_BUILDKIT_TAG=}"
+: "${TEST_BUILDKIT_IMAGE=}"
+: "${TEST_BUILDX_EXPERIMENTAL=}"
 
-case $buildmode in
-"buildkit")
-  tmpfile=$(mktemp -t docker-iidfile.XXXXXXXXXX)
-  buildctl build $progressFlag --frontend=dockerfile.v0 \
-    --local context=. --local dockerfile=. \
-    --frontend-opt target=integration-tests \
-    --output type=docker,name=$iid,dest=$tmpfile
-  docker load -i $tmpfile
-  rm $tmpfile
-  ;;
-"docker-buildkit")
-  export DOCKER_BUILDKIT=1
-  docker build --iidfile $iidfile --target integration-tests --force-rm .
-  iid=$(cat $iidfile)
-  ;;
-*)
-  echo "docker with buildkit support is required"
-  exit 1
-  ;;
-esac
-
-cacheVolume="buildx-cache"
-if ! docker inspect "$cacheVolume" 2>&1 >/dev/null ; then
-cacheVolume=$(docker create --name=buildx-cache -v /root/.cache -v /go/pkg/mod alpine)
+if [ "$TEST_IMAGE_BUILD" = "1" ]; then
+  ${BUILDX_CMD} bake integration-test --set "*.output=type=docker,name=$TEST_IMAGE_ID"
 fi
 
-docker run --rm -v /tmp --volumes-from=$cacheVolume --privileged $iid go test ${TESTFLAGS:--v} ${TESTPKGS:-./...}
+testReportsDir="$(pwd)/bin/testreports"
+mkdir -p "$testReportsDir"
+testReportsVol="-v $testReportsDir:/testreports"
+gotestsumArgs="--format=standard-verbose --jsonfile=/testreports/go-test-report$TEST_REPORT_SUFFIX.json --junitfile=/testreports/junit-report$TEST_REPORT_SUFFIX.xml"
+gotestArgs="-mod=vendor -coverprofile=/testreports/coverage-report$TEST_REPORT_SUFFIX.txt -covermode=atomic"
 
-if [ -n "$BUILDX_NOCACHE" ]; then
-  docker rm -v $cacheVolume
+cacheVolume="buildx-test-cache"
+if ! docker container inspect "$cacheVolume" >/dev/null 2>/dev/null; then
+  docker create -v /root/.cache -v /root/.cache/registry -v /root/.cache/undock -v /go/pkg/mod --name "$cacheVolume" alpine
+fi
+if [ "$TEST_KEEP_CACHE" != "1" ]; then
+  trap 'docker rm -v $cacheVolume' EXIT
 fi
 
-case $buildmode in
-"docker-buildkit")
-  rm "$iidfile"
-  docker rmi $iid
-  ;;
-esac
+cid=$(docker create --rm -v /tmp $testReportsVol --volumes-from=$cacheVolume -e GITHUB_REF -e TEST_DOCKERD -e TEST_BUILDKIT_IMAGE -e TEST_BUILDKIT_TAG -e TEST_BUILDX_EXPERIMENTAL -e SKIP_INTEGRATION_TESTS -e GOTESTSUM_FORMAT ${BUILDKIT_INTEGRATION_SNAPSHOTTER:+"-eBUILDKIT_INTEGRATION_SNAPSHOTTER"} -e BUILDKIT_REGISTRY_MIRROR_DIR=/root/.cache/registry --privileged $TEST_IMAGE_ID gotestsum $gotestsumArgs --packages="${TESTPKGS:-./...}" -- $gotestArgs ${TESTFLAGS:--v})
+docker start -a -i $cid

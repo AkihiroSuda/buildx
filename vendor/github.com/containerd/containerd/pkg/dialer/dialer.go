@@ -17,10 +17,10 @@
 package dialer
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"time"
-
-	"github.com/pkg/errors"
 )
 
 type dialResult struct {
@@ -28,8 +28,19 @@ type dialResult struct {
 	err error
 }
 
+// ContextDialer returns a GRPC net.Conn connected to the provided address
+func ContextDialer(ctx context.Context, address string) (net.Conn, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		return timeoutDialer(address, time.Until(deadline))
+	}
+	return timeoutDialer(address, 0)
+}
+
 // Dialer returns a GRPC net.Conn connected to the provided address
-func Dialer(address string, timeout time.Duration) (net.Conn, error) {
+// Deprecated: use ContextDialer and grpc.WithContextDialer.
+var Dialer = timeoutDialer
+
+func timeoutDialer(address string, timeout time.Duration) (net.Conn, error) {
 	var (
 		stopC = make(chan struct{})
 		synC  = make(chan *dialResult)
@@ -62,6 +73,6 @@ func Dialer(address string, timeout time.Duration) (net.Conn, error) {
 				dr.c.Close()
 			}
 		}()
-		return nil, errors.Errorf("dial %s: timeout", address)
+		return nil, fmt.Errorf("dial %s: timeout", address)
 	}
 }

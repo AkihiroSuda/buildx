@@ -1,9 +1,23 @@
 package appdefaults
 
+import (
+	"os"
+	"path/filepath"
+)
+
 const (
-	Address   = "npipe:////./pipe/buildkitd"
-	Root      = ".buildstate"
-	ConfigDir = ""
+	Address = "npipe:////./pipe/buildkitd"
+)
+
+var (
+	Root                 = filepath.Join(os.Getenv("ProgramData"), "buildkitd", ".buildstate")
+	ConfigDir            = filepath.Join(os.Getenv("ProgramData"), "buildkitd")
+	DefaultCNIBinDir     = filepath.Join(ConfigDir, "bin")
+	DefaultCNIConfigPath = filepath.Join(ConfigDir, "cni.json")
+)
+
+var (
+	UserCNIConfigPath = DefaultCNIConfigPath
 )
 
 func UserAddress() string {
@@ -20,4 +34,8 @@ func UserRoot() string {
 
 func UserConfigDir() string {
 	return ConfigDir
+}
+
+func TraceSocketPath(inUserNS bool) string {
+	return `\\.\pipe\buildkit-otel-grpc`
 }

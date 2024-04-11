@@ -1,0 +1,48 @@
+name: validate
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+      - 'v[0-9]*'
+    tags:
+      - 'v*'
+  pull_request:
+    paths-ignore:
+      - '.github/releases.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - lint
+          - validate-vendor
+          - validate-docs
+          - validate-generated-files
+    steps:
+      -
+        name: Prepare
+        run: |
+          if [ "$GITHUB_REPOSITORY" = "docker/buildx" ]; then
+            echo "GOLANGCI_LINT_MULTIPLATFORM=1" >> $GITHUB_ENV
+          fi
+      -
+        name: Checkout
+        uses: actions/checkout@v4
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+      -
+        name: Run
+        run: |
+          make ${{ matrix.target }}

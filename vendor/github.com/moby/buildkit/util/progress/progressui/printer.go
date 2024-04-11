@@ -1,6 +1,7 @@
 package progressui
 
 import (
+	"container/ring"
 	"context"
 	"fmt"
 	"io"
@@ -18,16 +19,20 @@ const maxDelay = 10 * time.Second
 const minTimeDelta = 5 * time.Second
 const minProgressDelta = 0.05 // %
 
+const logsBufferSize = 10
+
 type lastStatus struct {
 	Current   int64
 	Timestamp time.Time
 }
 
 type textMux struct {
-	w        io.Writer
-	current  digest.Digest
-	last     map[string]lastStatus
-	notFirst bool
+	w         io.Writer
+	current   digest.Digest
+	last      map[string]lastStatus
+	notFirst  bool
+	nextIndex int
+	desc      string
 }
 
 func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
@@ -38,6 +43,11 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 	v, ok := t.byDigest[dgst]
 	if !ok {
 		return
+	}
+
+	if v.index == 0 {
+		p.nextIndex++
+		v.index = p.nextIndex
 	}
 
 	if dgst != p.current {
@@ -54,16 +64,17 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 		if p.notFirst {
 			fmt.Fprintln(p.w, "")
 		} else {
+			if p.desc != "" {
+				fmt.Fprintf(p.w, "#0 %s\n\n", p.desc)
+			}
 			p.notFirst = true
 		}
 
-		if os.Getenv("PROGRESS_NO_TRUNC") == "1" {
-			fmt.Fprintf(p.w, "#%d %s\n", v.index, v.Name)
-			fmt.Fprintf(p.w, "#%d %s\n", v.index, v.Digest)
-		} else {
+		if os.Getenv("PROGRESS_NO_TRUNC") == "0" {
 			fmt.Fprintf(p.w, "#%d %s\n", v.index, limitString(v.Name, 72))
+		} else {
+			fmt.Fprintf(p.w, "#%d %s\n", v.index, v.Name)
 		}
-
 	}
 
 	if len(v.events) != 0 {
@@ -74,6 +85,7 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 	}
 	v.events = v.events[:0]
 
+	isOpenStatus := false // remote cache loading can currently produce status updates without active vertex
 	for _, s := range v.statuses {
 		if _, ok := v.statusUpdates[s.ID]; ok {
 			doPrint := true
@@ -117,19 +129,36 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 			}
 			if s.Completed != nil {
 				tm += " done"
+			} else {
+				isOpenStatus = true
 			}
 			fmt.Fprintf(p.w, "#%d %s%s%s\n", v.index, s.ID, bytes, tm)
 		}
 	}
 	v.statusUpdates = map[string]struct{}{}
 
+	for _, w := range v.warnings[v.warningIdx:] {
+		fmt.Fprintf(p.w, "#%d WARN: %s\n", v.index, w.Short)
+		v.warningIdx++
+	}
+
 	for i, l := range v.logs {
-		if i == 0 {
+		if i == 0 && v.logsOffset != 0 { // index has already been printed
 			l = l[v.logsOffset:]
+			fmt.Fprintf(p.w, "%s", l)
+		} else {
+			fmt.Fprintf(p.w, "#%d %s", v.index, []byte(l))
 		}
-		fmt.Fprintf(p.w, "%s", []byte(l))
+
 		if i != len(v.logs)-1 || !v.logsPartial {
 			fmt.Fprintln(p.w, "")
+		}
+		if v.logsBuffer == nil {
+			v.logsBuffer = ring.New(logsBufferSize)
+		}
+		v.logsBuffer.Value = l
+		if !v.logsPartial {
+			v.logsBuffer = v.logsBuffer.Next()
 		}
 	}
 
@@ -144,14 +173,14 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 	}
 
 	p.current = dgst
-	if v.Completed != nil {
+	if v.isCompleted() && !isOpenStatus {
 		p.current = ""
 		v.count = 0
 
+		if v.logsPartial {
+			fmt.Fprintln(p.w, "")
+		}
 		if v.Error != "" {
-			if v.logsPartial {
-				fmt.Fprintln(p.w, "")
-			}
 			if strings.HasSuffix(v.Error, context.Canceled.Error()) {
 				fmt.Fprintf(p.w, "#%d CANCELED\n", v.index)
 			} else {
@@ -161,12 +190,20 @@ func (p *textMux) printVtx(t *trace, dgst digest.Digest) {
 			fmt.Fprintf(p.w, "#%d CACHED\n", v.index)
 		} else {
 			tm := ""
-			if v.Started != nil {
-				tm = fmt.Sprintf(" %.1fs", v.Completed.Sub(*v.Started).Seconds())
+			var ivals []interval
+			for _, ival := range v.intervals {
+				ivals = append(ivals, ival)
+			}
+			ivals = mergeIntervals(ivals)
+			if len(ivals) > 0 {
+				var dt float64
+				for _, ival := range ivals {
+					dt += ival.duration().Seconds()
+				}
+				tm = fmt.Sprintf(" %.1fs", dt)
 			}
 			fmt.Fprintf(p.w, "#%d DONE%s\n", v.index, tm)
 		}
-
 	}
 
 	delete(t.updates, dgst)
@@ -178,7 +215,9 @@ func sortCompleted(t *trace, m map[digest.Digest]struct{}) []digest.Digest {
 		out = append(out, k)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return t.byDigest[out[i]].Completed.Before(*t.byDigest[out[j]].Completed)
+		vtxi := t.byDigest[out[i]]
+		vtxj := t.byDigest[out[j]]
+		return vtxi.mostRecentInterval().stop.Before(*vtxj.mostRecentInterval().stop)
 	})
 	return out
 }
@@ -192,7 +231,11 @@ func (p *textMux) print(t *trace) {
 		if !ok {
 			continue
 		}
-		if v.Vertex.Completed != nil {
+		if v.ProgressGroup != nil || v.hidden {
+			// skip vtxs in a group (they are merged into a single vtx) and hidden ones
+			continue
+		}
+		if v.isCompleted() {
 			completed[dgst] = struct{}{}
 		} else {
 			rest[dgst] = struct{}{}
@@ -214,13 +257,13 @@ func (p *textMux) print(t *trace) {
 
 	if len(rest) == 0 {
 		if current != "" {
-			if v := t.byDigest[current]; v.Started != nil && v.Completed == nil {
+			if v := t.byDigest[current]; v.isStarted() && !v.isCompleted() {
 				return
 			}
 		}
 		// make any open vertex active
 		for dgst, v := range t.byDigest {
-			if v.Started != nil && v.Completed == nil {
+			if v.isStarted() && !v.isCompleted() && v.ProgressGroup == nil && !v.hidden {
 				p.printVtx(t, dgst)
 				return
 			}
@@ -243,6 +286,10 @@ func (p *textMux) print(t *trace) {
 	for dgst := range rest {
 		v, ok := t.byDigest[dgst]
 		if !ok {
+			continue
+		}
+		if v.lastBlockTime == nil {
+			// shouldn't happen, but not worth crashing over
 			continue
 		}
 		tm := now.Sub(*v.lastBlockTime)

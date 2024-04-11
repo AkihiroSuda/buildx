@@ -1,24 +1,23 @@
 package command
 
 import (
-	"fmt"
+	"context"
 	"io"
 	"os"
 	"strconv"
 
-	"github.com/docker/cli/cli/context/docker"
-	"github.com/docker/cli/cli/context/kubernetes"
-	"github.com/docker/cli/cli/context/store"
 	"github.com/docker/cli/cli/streams"
-	clitypes "github.com/docker/cli/types"
-	"github.com/docker/docker/pkg/term"
+	"github.com/docker/docker/client"
+	"github.com/moby/term"
 )
 
-// DockerCliOption applies a modification on a DockerCli.
-type DockerCliOption func(cli *DockerCli) error
+// CLIOption is a functional argument to apply options to a [DockerCli]. These
+// options can be passed to [NewDockerCli] to initialize a new CLI, or
+// applied with [DockerCli.Initialize] or [DockerCli.Apply].
+type CLIOption func(cli *DockerCli) error
 
 // WithStandardStreams sets a cli in, out and err streams with the standard streams.
-func WithStandardStreams() DockerCliOption {
+func WithStandardStreams() CLIOption {
 	return func(cli *DockerCli) error {
 		// Set terminal emulation based on platform as required.
 		stdin, stdout, stderr := term.StdStreams()
@@ -29,8 +28,17 @@ func WithStandardStreams() DockerCliOption {
 	}
 }
 
+// WithBaseContext sets the base context of a cli. It is used to propagate
+// the context from the command line to the client.
+func WithBaseContext(ctx context.Context) CLIOption {
+	return func(cli *DockerCli) error {
+		cli.baseCtx = ctx
+		return nil
+	}
+}
+
 // WithCombinedStreams uses the same stream for the output and error streams.
-func WithCombinedStreams(combined io.Writer) DockerCliOption {
+func WithCombinedStreams(combined io.Writer) CLIOption {
 	return func(cli *DockerCli) error {
 		cli.out = streams.NewOut(combined)
 		cli.err = combined
@@ -39,7 +47,7 @@ func WithCombinedStreams(combined io.Writer) DockerCliOption {
 }
 
 // WithInputStream sets a cli input stream.
-func WithInputStream(in io.ReadCloser) DockerCliOption {
+func WithInputStream(in io.ReadCloser) CLIOption {
 	return func(cli *DockerCli) error {
 		cli.in = streams.NewIn(in)
 		return nil
@@ -47,7 +55,7 @@ func WithInputStream(in io.ReadCloser) DockerCliOption {
 }
 
 // WithOutputStream sets a cli output stream.
-func WithOutputStream(out io.Writer) DockerCliOption {
+func WithOutputStream(out io.Writer) CLIOption {
 	return func(cli *DockerCli) error {
 		cli.out = streams.NewOut(out)
 		return nil
@@ -55,7 +63,7 @@ func WithOutputStream(out io.Writer) DockerCliOption {
 }
 
 // WithErrorStream sets a cli error stream.
-func WithErrorStream(err io.Writer) DockerCliOption {
+func WithErrorStream(err io.Writer) CLIOption {
 	return func(cli *DockerCli) error {
 		cli.err = err
 		return nil
@@ -63,7 +71,7 @@ func WithErrorStream(err io.Writer) DockerCliOption {
 }
 
 // WithContentTrustFromEnv enables content trust on a cli from environment variable DOCKER_CONTENT_TRUST value.
-func WithContentTrustFromEnv() DockerCliOption {
+func WithContentTrustFromEnv() CLIOption {
 	return func(cli *DockerCli) error {
 		cli.contentTrust = false
 		if e := os.Getenv("DOCKER_CONTENT_TRUST"); e != "" {
@@ -77,30 +85,25 @@ func WithContentTrustFromEnv() DockerCliOption {
 }
 
 // WithContentTrust enables content trust on a cli.
-func WithContentTrust(enabled bool) DockerCliOption {
+func WithContentTrust(enabled bool) CLIOption {
 	return func(cli *DockerCli) error {
 		cli.contentTrust = enabled
 		return nil
 	}
 }
 
-// WithContainerizedClient sets the containerized client constructor on a cli.
-func WithContainerizedClient(containerizedFn func(string) (clitypes.ContainerizedClient, error)) DockerCliOption {
+// WithDefaultContextStoreConfig configures the cli to use the default context store configuration.
+func WithDefaultContextStoreConfig() CLIOption {
 	return func(cli *DockerCli) error {
-		cli.newContainerizeClient = containerizedFn
+		cli.contextStoreConfig = DefaultContextStoreConfig()
 		return nil
 	}
 }
 
-// WithContextEndpointType add support for an additional typed endpoint in the context store
-// Plugins should use this to store additional endpoints configuration in the context store
-func WithContextEndpointType(endpointName string, endpointType store.TypeGetter) DockerCliOption {
+// WithAPIClient configures the cli to use the given API client.
+func WithAPIClient(c client.APIClient) CLIOption {
 	return func(cli *DockerCli) error {
-		switch endpointName {
-		case docker.DockerEndpoint, kubernetes.KubernetesEndpoint:
-			return fmt.Errorf("cannot change %q endpoint type", endpointName)
-		}
-		cli.contextStoreConfig.SetEndpoint(endpointName, endpointType)
+		cli.client = c
 		return nil
 	}
 }

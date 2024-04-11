@@ -2,16 +2,23 @@ package driver
 
 import (
 	"context"
+	"os"
 	"sort"
+	"strings"
+	"sync"
 
 	dockerclient "github.com/docker/docker/client"
+	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/tracing/detect"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"k8s.io/client-go/rest"
 )
 
 type Factory interface {
 	Name() string
 	Usage() string
-	Priority(context.Context, dockerclient.APIClient) int
+	Priority(ctx context.Context, endpoint string, api dockerclient.APIClient, dialMeta map[string][]string) int
 	New(ctx context.Context, cfg InitConfig) (Driver, error)
 	AllowsInstances() bool
 }
@@ -21,12 +28,38 @@ type BuildkitConfig struct {
 	// Rootless bool
 }
 
+type KubeClientConfig interface {
+	ClientConfig() (*rest.Config, error)
+	Namespace() (string, bool, error)
+}
+
+type KubeClientConfigInCluster struct{}
+
+func (k KubeClientConfigInCluster) ClientConfig() (*rest.Config, error) {
+	return rest.InClusterConfig()
+}
+
+func (k KubeClientConfigInCluster) Namespace() (string, bool, error) {
+	namespace, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return "", false, err
+	}
+	return strings.TrimSpace(string(namespace)), true, nil
+}
+
 type InitConfig struct {
 	// This object needs updates to be generic for different drivers
-	Name           string
-	DockerAPI      dockerclient.APIClient
-	BuildkitConfig BuildkitConfig
-	Meta           map[string]interface{}
+	Name             string
+	EndpointAddr     string
+	DockerAPI        dockerclient.APIClient
+	KubeClientConfig KubeClientConfig
+	BuildkitdFlags   []string
+	Files            map[string][]byte
+	DriverOpts       map[string]string
+	Auth             Auth
+	Platforms        []specs.Platform
+	ContextPathHash  string // can be used for determining pods in the driver instance
+	DialMeta         map[string][]string
 }
 
 var drivers map[string]Factory
@@ -38,7 +71,7 @@ func Register(f Factory) {
 	drivers[f.Name()] = f
 }
 
-func GetDefaultFactory(ctx context.Context, c dockerclient.APIClient, instanceRequired bool) (Factory, error) {
+func GetDefaultFactory(ctx context.Context, ep string, c dockerclient.APIClient, instanceRequired bool, dialMeta map[string][]string) (Factory, error) {
 	if len(drivers) == 0 {
 		return nil, errors.Errorf("no drivers available")
 	}
@@ -51,7 +84,7 @@ func GetDefaultFactory(ctx context.Context, c dockerclient.APIClient, instanceRe
 		if instanceRequired && !f.AllowsInstances() {
 			continue
 		}
-		dd = append(dd, p{f: f, priority: f.Priority(ctx, c)})
+		dd = append(dd, p{f: f, priority: f.Priority(ctx, ep, c, dialMeta)})
 	}
 	sort.Slice(dd, func(i, j int) bool {
 		return dd[i].priority < dd[j].priority
@@ -59,29 +92,98 @@ func GetDefaultFactory(ctx context.Context, c dockerclient.APIClient, instanceRe
 	return dd[0].f, nil
 }
 
-func GetFactory(name string, instanceRequired bool) Factory {
+func GetFactory(name string, instanceRequired bool) (Factory, error) {
 	for _, f := range drivers {
-		if instanceRequired && !f.AllowsInstances() {
-			continue
-		}
 		if f.Name() == name {
-			return f
+			if instanceRequired && !f.AllowsInstances() {
+				return nil, errors.Errorf("additional instances of driver %q cannot be created", name)
+			}
+			return f, nil
 		}
 	}
-	return nil
+	return nil, errors.Errorf("failed to find driver %q", name)
 }
 
-func GetDriver(ctx context.Context, name string, f Factory, api dockerclient.APIClient) (Driver, error) {
+func GetDriver(ctx context.Context, name string, f Factory, endpointAddr string, api dockerclient.APIClient, auth Auth, kcc KubeClientConfig, buildkitdFlags []string, files map[string][]byte, do map[string]string, platforms []specs.Platform, contextPathHash string, dialMeta map[string][]string) (*DriverHandle, error) {
 	ic := InitConfig{
-		DockerAPI: api,
-		Name:      name,
+		EndpointAddr:     endpointAddr,
+		DockerAPI:        api,
+		KubeClientConfig: kcc,
+		Name:             name,
+		BuildkitdFlags:   buildkitdFlags,
+		DriverOpts:       do,
+		Auth:             auth,
+		Platforms:        platforms,
+		ContextPathHash:  contextPathHash,
+		DialMeta:         dialMeta,
+		Files:            files,
 	}
 	if f == nil {
 		var err error
-		f, err = GetDefaultFactory(ctx, api, false)
+		f, err = GetDefaultFactory(ctx, endpointAddr, api, false, dialMeta)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return f.New(ctx, ic)
+	d, err := f.New(ctx, ic)
+	if err != nil {
+		return nil, err
+	}
+	return &DriverHandle{Driver: d}, nil
+}
+
+func GetFactories(instanceRequired bool) []Factory {
+	ds := make([]Factory, 0, len(drivers))
+	for _, d := range drivers {
+		if instanceRequired && !d.AllowsInstances() {
+			continue
+		}
+		ds = append(ds, d)
+	}
+	sort.Slice(ds, func(i, j int) bool {
+		return ds[i].Name() < ds[j].Name()
+	})
+	return ds
+}
+
+type DriverHandle struct {
+	Driver
+	client                  *client.Client
+	err                     error
+	once                    sync.Once
+	historyAPISupportedOnce sync.Once
+	historyAPISupported     bool
+}
+
+func (d *DriverHandle) Client(ctx context.Context) (*client.Client, error) {
+	d.once.Do(func() {
+		opts, err := d.getClientOptions()
+		if err != nil {
+			d.err = err
+			return
+		}
+		d.client, d.err = d.Driver.Client(ctx, opts...)
+	})
+	return d.client, d.err
+}
+
+func (d *DriverHandle) getClientOptions() ([]client.ClientOpt, error) {
+	exp, _, err := detect.Exporter()
+	if err != nil {
+		return nil, err
+	} else if td, ok := exp.(client.TracerDelegate); ok {
+		return []client.ClientOpt{
+			client.WithTracerDelegate(td),
+		}, nil
+	}
+	return nil, nil
+}
+
+func (d *DriverHandle) HistoryAPISupported(ctx context.Context) bool {
+	d.historyAPISupportedOnce.Do(func() {
+		if c, err := d.Client(ctx); err == nil {
+			d.historyAPISupported = historyAPISupported(ctx, c)
+		}
+	})
+	return d.historyAPISupported
 }

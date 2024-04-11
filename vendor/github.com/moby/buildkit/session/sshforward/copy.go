@@ -1,14 +1,20 @@
 package sshforward
 
 import (
-	io "io"
+	"context"
+	"io"
 
-	context "golang.org/x/net/context"
+	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 )
 
-func Copy(ctx context.Context, conn io.ReadWriteCloser, stream grpc.Stream) error {
+type Stream interface {
+	SendMsg(m interface{}) error
+	RecvMsg(m interface{}) error
+}
+
+func Copy(ctx context.Context, conn io.ReadWriteCloser, stream Stream, closeStream func() error) error {
+	defer conn.Close()
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() (retErr error) {
@@ -16,20 +22,29 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream grpc.Stream) erro
 		for {
 			if err := stream.RecvMsg(p); err != nil {
 				if err == io.EOF {
+					// indicates client performed CloseSend, but they may still be
+					// reading data
+					if closeWriter, ok := conn.(interface {
+						CloseWrite() error
+					}); ok {
+						closeWriter.CloseWrite()
+					} else {
+						conn.Close()
+					}
 					return nil
 				}
 				conn.Close()
-				return err
+				return errors.WithStack(err)
 			}
 			select {
 			case <-ctx.Done():
 				conn.Close()
-				return ctx.Err()
+				return context.Cause(ctx)
 			default:
 			}
 			if _, err := conn.Write(p.Data); err != nil {
 				conn.Close()
-				return err
+				return errors.WithStack(err)
 			}
 			p.Data = p.Data[:0]
 		}
@@ -41,18 +56,21 @@ func Copy(ctx context.Context, conn io.ReadWriteCloser, stream grpc.Stream) erro
 			n, err := conn.Read(buf)
 			switch {
 			case err == io.EOF:
+				if closeStream != nil {
+					closeStream()
+				}
 				return nil
 			case err != nil:
-				return err
+				return errors.WithStack(err)
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return context.Cause(ctx)
 			default:
 			}
 			p := &BytesMessage{Data: buf[:n]}
 			if err := stream.SendMsg(p); err != nil {
-				return err
+				return errors.WithStack(err)
 			}
 		}
 	})

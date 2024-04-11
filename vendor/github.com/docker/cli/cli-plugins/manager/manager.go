@@ -1,22 +1,33 @@
 package manager
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/config"
+	"github.com/docker/cli/cli/config/configfile"
+	"github.com/fvbommel/sortorder"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 )
 
-// ReexecEnvvar is the name of an ennvar which is set to the command
-// used to originally invoke the docker CLI when executing a
-// plugin. Assuming $PATH and $CWD remain unchanged this should allow
-// the plugin to re-execute the original CLI.
-const ReexecEnvvar = "DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND"
+const (
+	// ReexecEnvvar is the name of an ennvar which is set to the command
+	// used to originally invoke the docker CLI when executing a
+	// plugin. Assuming $PATH and $CWD remain unchanged this should allow
+	// the plugin to re-execute the original CLI.
+	ReexecEnvvar = "DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND"
+
+	// ResourceAttributesEnvvar is the name of the envvar that includes additional
+	// resource attributes for OTEL.
+	ResourceAttributesEnvvar = "OTEL_RESOURCE_ATTRIBUTES"
+)
 
 // errPluginNotFound is the error returned when a plugin could not be found.
 type errPluginNotFound string
@@ -31,14 +42,17 @@ type notFound interface{ NotFound() }
 
 // IsNotFound is true if the given error is due to a plugin not being found.
 func IsNotFound(err error) bool {
+	if e, ok := err.(*pluginError); ok {
+		err = e.Cause()
+	}
 	_, ok := err.(notFound)
 	return ok
 }
 
-func getPluginDirs(dockerCli command.Cli) ([]string, error) {
+func getPluginDirs(cfg *configfile.ConfigFile) ([]string, error) {
 	var pluginDirs []string
 
-	if cfg := dockerCli.ConfigFile(); cfg != nil {
+	if cfg != nil {
 		pluginDirs = append(pluginDirs, cfg.CLIPluginsExtraDirs...)
 	}
 	pluginDir, err := config.Path("cli-plugins")
@@ -52,12 +66,12 @@ func getPluginDirs(dockerCli command.Cli) ([]string, error) {
 }
 
 func addPluginCandidatesFromDir(res map[string][]string, d string) error {
-	dentries, err := ioutil.ReadDir(d)
+	dentries, err := os.ReadDir(d)
 	if err != nil {
 		return err
 	}
 	for _, dentry := range dentries {
-		switch dentry.Mode() & os.ModeType {
+		switch dentry.Type() & os.ModeType {
 		case 0, os.ModeSymlink:
 			// Regular file or symlink, keep going
 		default:
@@ -99,9 +113,39 @@ func listPluginCandidates(dirs []string) (map[string][]string, error) {
 	return result, nil
 }
 
+// GetPlugin returns a plugin on the system by its name
+func GetPlugin(name string, dockerCli command.Cli, rootcmd *cobra.Command) (*Plugin, error) {
+	pluginDirs, err := getPluginDirs(dockerCli.ConfigFile())
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, err := listPluginCandidates(pluginDirs)
+	if err != nil {
+		return nil, err
+	}
+
+	if paths, ok := candidates[name]; ok {
+		if len(paths) == 0 {
+			return nil, errPluginNotFound(name)
+		}
+		c := &candidate{paths[0]}
+		p, err := newPlugin(c, rootcmd.Commands())
+		if err != nil {
+			return nil, err
+		}
+		if !IsNotFound(p.Err) {
+			p.ShadowedPaths = paths[1:]
+		}
+		return &p, nil
+	}
+
+	return nil, errPluginNotFound(name)
+}
+
 // ListPlugins produces a list of the plugins available on the system
 func ListPlugins(dockerCli command.Cli, rootcmd *cobra.Command) ([]Plugin, error) {
-	pluginDirs, err := getPluginDirs(dockerCli)
+	pluginDirs, err := getPluginDirs(dockerCli.ConfigFile())
 	if err != nil {
 		return nil, err
 	}
@@ -112,18 +156,37 @@ func ListPlugins(dockerCli command.Cli, rootcmd *cobra.Command) ([]Plugin, error
 	}
 
 	var plugins []Plugin
+	var mu sync.Mutex
+	eg, _ := errgroup.WithContext(context.TODO())
+	cmds := rootcmd.Commands()
 	for _, paths := range candidates {
-		if len(paths) == 0 {
-			continue
-		}
-		c := &candidate{paths[0]}
-		p, err := newPlugin(c, rootcmd)
-		if err != nil {
-			return nil, err
-		}
-		p.ShadowedPaths = paths[1:]
-		plugins = append(plugins, p)
+		func(paths []string) {
+			eg.Go(func() error {
+				if len(paths) == 0 {
+					return nil
+				}
+				c := &candidate{paths[0]}
+				p, err := newPlugin(c, cmds)
+				if err != nil {
+					return err
+				}
+				if !IsNotFound(p.Err) {
+					p.ShadowedPaths = paths[1:]
+					mu.Lock()
+					defer mu.Unlock()
+					plugins = append(plugins, p)
+				}
+				return nil
+			})
+		}(paths)
 	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
+	sort.Slice(plugins, func(i, j int) bool {
+		return sortorder.NaturalLess(plugins[i].Name, plugins[j].Name)
+	})
 
 	return plugins, nil
 }
@@ -142,7 +205,7 @@ func PluginRunCommand(dockerCli command.Cli, name string, rootcmd *cobra.Command
 		return nil, errPluginNotFound(name)
 	}
 	exename := addExeSuffix(NamePrefix + name)
-	pluginDirs, err := getPluginDirs(dockerCli)
+	pluginDirs, err := getPluginDirs(dockerCli.ConfigFile())
 	if err != nil {
 		return nil, err
 	}
@@ -159,11 +222,12 @@ func PluginRunCommand(dockerCli command.Cli, name string, rootcmd *cobra.Command
 		}
 
 		c := &candidate{path: path}
-		plugin, err := newPlugin(c, rootcmd)
+		plugin, err := newPlugin(c, rootcmd.Commands())
 		if err != nil {
 			return nil, err
 		}
 		if plugin.Err != nil {
+			// TODO: why are we not returning plugin.Err?
 			return nil, errPluginNotFound(name)
 		}
 		cmd := exec.Command(plugin.Path, args...)
@@ -178,8 +242,14 @@ func PluginRunCommand(dockerCli command.Cli, name string, rootcmd *cobra.Command
 
 		cmd.Env = os.Environ()
 		cmd.Env = append(cmd.Env, ReexecEnvvar+"="+os.Args[0])
+		cmd.Env = appendPluginResourceAttributesEnvvar(cmd.Env, rootcmd, plugin)
 
 		return cmd, nil
 	}
 	return nil, errPluginNotFound(name)
+}
+
+// IsPluginCommand checks if the given cmd is a plugin-stub.
+func IsPluginCommand(cmd *cobra.Command) bool {
+	return cmd.Annotations[CommandAnnotationPlugin] == "true"
 }

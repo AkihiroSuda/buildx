@@ -4,115 +4,128 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/driver"
+	"github.com/docker/buildx/util/cobrautil/completion"
+	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/util/appcontext"
+	"github.com/docker/cli/cli/debug"
+	"github.com/docker/go-units"
 	"github.com/spf13/cobra"
-	"github.com/tonistiigi/buildx/build"
-	"github.com/tonistiigi/buildx/driver"
-	"github.com/tonistiigi/buildx/store"
-	"github.com/tonistiigi/buildx/util/progress"
-	"golang.org/x/sync/errgroup"
 )
 
 type inspectOptions struct {
 	bootstrap bool
+	builder   string
 }
 
-type dinfo struct {
-	di        *build.DriverInfo
-	info      *driver.Info
-	platforms []string
-	err       error
-}
-
-type nginfo struct {
-	ng      *store.NodeGroup
-	drivers []dinfo
-	err     error
-}
-
-func runInspect(dockerCli command.Cli, in inspectOptions, args []string) error {
-	ctx := appcontext.Context()
-
-	txn, release, err := getStore(dockerCli)
+func runInspect(ctx context.Context, dockerCli command.Cli, in inspectOptions) error {
+	b, err := builder.New(dockerCli,
+		builder.WithName(in.builder),
+		builder.WithSkippedValidation(),
+	)
 	if err != nil {
 		return err
 	}
-	defer release()
 
-	var ng *store.NodeGroup
-
-	if len(args) > 0 {
-		ng, err = getNodeGroup(txn, dockerCli, args[0])
-		if err != nil {
-			return err
-		}
-	} else {
-		ng, err = getCurrentInstance(txn, dockerCli)
-		if err != nil {
-			return err
-		}
-	}
-
-	if ng == nil {
-		ng = &store.NodeGroup{
-			Name: "default",
-			Nodes: []store.Node{{
-				Name:     "default",
-				Endpoint: "default",
-			}},
-		}
-	}
-
-	ngi := &nginfo{ng: ng}
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	err = loadNodeGroupData(timeoutCtx, dockerCli, ngi)
-
+	nodes, err := b.LoadNodes(timeoutCtx, builder.WithData())
 	if in.bootstrap {
 		var ok bool
-		ok, err = boot(ctx, ngi)
+		ok, err = b.Boot(ctx)
 		if err != nil {
 			return err
 		}
 		if ok {
-			ngi = &nginfo{ng: ng}
-			err = loadNodeGroupData(ctx, dockerCli, ngi)
+			nodes, err = b.LoadNodes(timeoutCtx, builder.WithData())
 		}
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	fmt.Fprintf(w, "Name:\t%s\n", ngi.ng.Name)
-	fmt.Fprintf(w, "Driver:\t%s\n", ngi.ng.Driver)
+	fmt.Fprintf(w, "Name:\t%s\n", b.Name)
+	fmt.Fprintf(w, "Driver:\t%s\n", b.Driver)
+	if !b.NodeGroup.LastActivity.IsZero() {
+		fmt.Fprintf(w, "Last Activity:\t%v\n", b.NodeGroup.LastActivity)
+	}
+
 	if err != nil {
 		fmt.Fprintf(w, "Error:\t%s\n", err.Error())
-	} else if ngi.err != nil {
-		fmt.Fprintf(w, "Error:\t%s\n", ngi.err.Error())
+	} else if b.Err() != nil {
+		fmt.Fprintf(w, "Error:\t%s\n", b.Err().Error())
 	}
 	if err == nil {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Nodes:")
 
-		for i, n := range ngi.ng.Nodes {
+		for i, n := range nodes {
 			if i != 0 {
 				fmt.Fprintln(w, "")
 			}
 			fmt.Fprintf(w, "Name:\t%s\n", n.Name)
 			fmt.Fprintf(w, "Endpoint:\t%s\n", n.Endpoint)
-			if err := ngi.drivers[i].di.Err; err != nil {
-				fmt.Fprintf(w, "Error:\t%s\n", err.Error())
-			} else if err := ngi.drivers[i].err; err != nil {
+
+			var driverOpts []string
+			for k, v := range n.DriverOpts {
+				driverOpts = append(driverOpts, fmt.Sprintf("%s=%q", k, v))
+			}
+			if len(driverOpts) > 0 {
+				fmt.Fprintf(w, "Driver Options:\t%s\n", strings.Join(driverOpts, " "))
+			}
+
+			if err := n.Err; err != nil {
 				fmt.Fprintf(w, "Error:\t%s\n", err.Error())
 			} else {
-				fmt.Fprintf(w, "Status:\t%s\n", ngi.drivers[i].info.Status)
-				fmt.Fprintf(w, "Platforms:\t%s\n", strings.Join(append(n.Platforms, ngi.drivers[i].platforms...), ", "))
+				fmt.Fprintf(w, "Status:\t%s\n", nodes[i].DriverInfo.Status)
+				if len(n.BuildkitdFlags) > 0 {
+					fmt.Fprintf(w, "BuildKit daemon flags:\t%s\n", strings.Join(n.BuildkitdFlags, " "))
+				}
+				if nodes[i].Version != "" {
+					fmt.Fprintf(w, "BuildKit version:\t%s\n", nodes[i].Version)
+				}
+				platforms := platformutil.FormatInGroups(n.Node.Platforms, n.Platforms)
+				if len(platforms) > 0 {
+					fmt.Fprintf(w, "Platforms:\t%s\n", strings.Join(platforms, ", "))
+				}
+				if debug.IsEnabled() {
+					fmt.Fprintf(w, "Features:\n")
+					features := nodes[i].Driver.Features(ctx)
+					featKeys := make([]string, 0, len(features))
+					for k := range features {
+						featKeys = append(featKeys, string(k))
+					}
+					sort.Strings(featKeys)
+					for _, k := range featKeys {
+						fmt.Fprintf(w, "\t%s:\t%t\n", k, features[driver.Feature(k)])
+					}
+				}
+				if len(nodes[i].Labels) > 0 {
+					fmt.Fprintf(w, "Labels:\n")
+					for _, k := range sortedKeys(nodes[i].Labels) {
+						v := nodes[i].Labels[k]
+						fmt.Fprintf(w, "\t%s:\t%s\n", k, v)
+					}
+				}
+				for ri, rule := range nodes[i].GCPolicy {
+					fmt.Fprintf(w, "GC Policy rule#%d:\n", ri)
+					fmt.Fprintf(w, "\tAll:\t%v\n", rule.All)
+					if len(rule.Filter) > 0 {
+						fmt.Fprintf(w, "\tFilters:\t%s\n", strings.Join(rule.Filter, " "))
+					}
+					if rule.KeepDuration > 0 {
+						fmt.Fprintf(w, "\tKeep Duration:\t%v\n", rule.KeepDuration.String())
+					}
+					if rule.KeepBytes > 0 {
+						fmt.Fprintf(w, "\tKeep Bytes:\t%s\n", units.BytesSize(float64(rule.KeepBytes)))
+					}
+				}
 			}
 		}
 	}
@@ -122,7 +135,7 @@ func runInspect(dockerCli command.Cli, in inspectOptions, args []string) error {
 	return nil
 }
 
-func inspectCmd(dockerCli command.Cli) *cobra.Command {
+func inspectCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	var options inspectOptions
 
 	cmd := &cobra.Command{
@@ -130,52 +143,28 @@ func inspectCmd(dockerCli command.Cli) *cobra.Command {
 		Short: "Inspect current builder instance",
 		Args:  cli.RequiresMaxArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInspect(dockerCli, options, args)
+			options.builder = rootOpts.builder
+			if len(args) > 0 {
+				options.builder = args[0]
+			}
+			return runInspect(cmd.Context(), dockerCli, options)
 		},
+		ValidArgsFunction: completion.BuilderNames(dockerCli),
 	}
 
 	flags := cmd.Flags()
-
 	flags.BoolVar(&options.bootstrap, "bootstrap", false, "Ensure builder has booted before inspecting")
-
-	_ = flags
 
 	return cmd
 }
 
-func boot(ctx context.Context, ngi *nginfo) (bool, error) {
-	toBoot := make([]int, 0, len(ngi.drivers))
-	for i, d := range ngi.drivers {
-		if d.err != nil || d.di.Err != nil || d.di.Driver == nil || d.info == nil {
-			continue
-		}
-		if d.info.Status != driver.Running {
-			toBoot = append(toBoot, i)
-		}
+func sortedKeys(m map[string]string) []string {
+	s := make([]string, len(m))
+	i := 0
+	for k := range m {
+		s[i] = k
+		i++
 	}
-	if len(toBoot) == 0 {
-		return false, nil
-	}
-
-	pw := progress.NewPrinter(context.TODO(), os.Stderr, "auto")
-
-	mw := progress.NewMultiWriter(pw)
-
-	eg, _ := errgroup.WithContext(ctx)
-	for _, idx := range toBoot {
-		func(idx int) {
-			eg.Go(func() error {
-				pw := mw.WithPrefix(ngi.ng.Nodes[idx].Name, len(toBoot) > 1)
-				_, _, err := driver.Boot(ctx, ngi.drivers[idx].di.Driver, pw)
-				if err != nil {
-					ngi.drivers[idx].err = err
-				}
-				close(pw.Status())
-				<-pw.Done()
-				return nil
-			})
-		}(idx)
-	}
-
-	return true, eg.Wait()
+	sort.Strings(s)
+	return s
 }

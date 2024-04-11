@@ -22,12 +22,22 @@ import (
 	"os"
 )
 
-var ErrNotAConsole = errors.New("provided file is not a console")
+var (
+	ErrNotAConsole    = errors.New("provided file is not a console")
+	ErrNotImplemented = errors.New("not implemented")
+)
+
+type File interface {
+	io.ReadWriteCloser
+
+	// Fd returns its file descriptor
+	Fd() uintptr
+	// Name returns its file name
+	Name() string
+}
 
 type Console interface {
-	io.Reader
-	io.Writer
-	io.Closer
+	File
 
 	// Resize resizes the console to the provided window size
 	Resize(WinSize) error
@@ -38,14 +48,10 @@ type Console interface {
 	SetRaw() error
 	// DisableEcho disables echo on the console
 	DisableEcho() error
-	// Reset restores the console to its orignal state
+	// Reset restores the console to its original state
 	Reset() error
 	// Size returns the window size of the console
 	Size() (WinSize, error)
-	// Fd returns the console's file descriptor
-	Fd() uintptr
-	// Name returns the console's file name
-	Name() string
 }
 
 // WinSize specifies the window size of the console
@@ -58,19 +64,25 @@ type WinSize struct {
 	y     uint16
 }
 
-// Current returns the current processes console
-func Current() Console {
-	c, err := ConsoleFromFile(os.Stdin)
-	if err != nil {
-		// stdin should always be a console for the design
-		// of this function
-		panic(err)
+// Current returns the current process' console
+func Current() (c Console) {
+	var err error
+	// Usually all three streams (stdin, stdout, and stderr)
+	// are open to the same console, but some might be redirected,
+	// so try all three.
+	for _, s := range []*os.File{os.Stderr, os.Stdout, os.Stdin} {
+		if c, err = ConsoleFromFile(s); err == nil {
+			return c
+		}
 	}
-	return c
+	// One of the std streams should always be a console
+	// for the design of this function.
+	panic(err)
 }
 
 // ConsoleFromFile returns a console using the provided file
-func ConsoleFromFile(f *os.File) (Console, error) {
+// nolint:revive
+func ConsoleFromFile(f File) (Console, error) {
 	if err := checkConsole(f); err != nil {
 		return nil, err
 	}

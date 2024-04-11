@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"net/url"
+	"strings"
 
 	"github.com/docker/cli/cli/connhelper/commandconn"
 	"github.com/docker/cli/cli/connhelper/ssh"
@@ -22,21 +23,39 @@ type ConnectionHelper struct {
 //
 // ssh://<user>@<host> URL requires Docker 18.09 or later on the remote host.
 func GetConnectionHelper(daemonURL string) (*ConnectionHelper, error) {
+	return getConnectionHelper(daemonURL, nil)
+}
+
+// GetConnectionHelperWithSSHOpts returns Docker-specific connection helper for
+// the given URL, and accepts additional options for ssh connections. It returns
+// nil without error when no helper is registered for the scheme.
+//
+// Requires Docker 18.09 or later on the remote host.
+func GetConnectionHelperWithSSHOpts(daemonURL string, sshFlags []string) (*ConnectionHelper, error) {
+	return getConnectionHelper(daemonURL, sshFlags)
+}
+
+func getConnectionHelper(daemonURL string, sshFlags []string) (*ConnectionHelper, error) {
 	u, err := url.Parse(daemonURL)
 	if err != nil {
 		return nil, err
 	}
-	switch scheme := u.Scheme; scheme {
-	case "ssh":
+	if u.Scheme == "ssh" {
 		sp, err := ssh.ParseURL(daemonURL)
 		if err != nil {
 			return nil, errors.Wrap(err, "ssh host connection is not valid")
 		}
 		return &ConnectionHelper{
 			Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return commandconn.New(ctx, "ssh", append(sp.Args(), []string{"--", "docker", "system", "dial-stdio"}...)...)
+				args := []string{"docker"}
+				if sp.Path != "" {
+					args = append(args, "--host", "unix://"+sp.Path)
+				}
+				sshFlags = addSSHTimeout(sshFlags)
+				args = append(args, "system", "dial-stdio")
+				return commandconn.New(ctx, "ssh", append(sshFlags, sp.Args(args...)...)...)
 			},
-			Host: "http://docker",
+			Host: "http://docker.example.com",
 		}, nil
 	}
 	// Future version may support plugins via ~/.docker/config.json. e.g. "dind"
@@ -50,6 +69,13 @@ func GetCommandConnectionHelper(cmd string, flags ...string) (*ConnectionHelper,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return commandconn.New(ctx, cmd, flags...)
 		},
-		Host: "http://docker",
+		Host: "http://docker.example.com",
 	}, nil
+}
+
+func addSSHTimeout(sshFlags []string) []string {
+	if !strings.Contains(strings.Join(sshFlags, ""), "ConnectTimeout") {
+		sshFlags = append(sshFlags, "-o ConnectTimeout=30")
+	}
+	return sshFlags
 }

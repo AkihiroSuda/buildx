@@ -12,42 +12,61 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
 	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type StateOption func(State) State
 
 type Output interface {
-	ToInput(*Constraints) (*pb.Input, error)
-	Vertex() Vertex
+	ToInput(context.Context, *Constraints) (*pb.Input, error)
+	Vertex(context.Context, *Constraints) Vertex
 }
 
 type Vertex interface {
-	Validate() error
-	Marshal(*Constraints) (digest.Digest, []byte, *pb.OpMetadata, error)
+	Validate(context.Context, *Constraints) error
+	Marshal(context.Context, *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error)
 	Output() Output
 	Inputs() []Output
+}
+
+func NewConstraints(co ...ConstraintsOpt) *Constraints {
+	defaultPlatform := platforms.Normalize(platforms.DefaultSpec())
+	c := &Constraints{
+		Platform:      &defaultPlatform,
+		LocalUniqueID: identity.NewID(),
+	}
+	for _, o := range co {
+		o.SetConstraintsOption(c)
+	}
+	return c
 }
 
 func NewState(o Output) State {
 	s := State{
 		out: o,
-		ctx: context.Background(),
-	}
-	s = dir("/")(s)
+	}.Dir("/")
 	s = s.ensurePlatform()
 	return s
 }
 
+// State represents all operations that must be done to produce a given output.
+// States are immutable, and all operations return a new state linked to the previous one.
+// State is the core type of the LLB API and is used to build a graph of operations.
+// The graph is then marshaled into a definition that can be executed by a backend (such as buildkitd).
+//
+// Operations performed on a State are executed lazily after the entire state graph is marshalled and sent to the backend.
 type State struct {
-	out  Output
-	ctx  context.Context
-	opts []ConstraintsOpt
+	out   Output
+	prev  *State
+	key   interface{}
+	value func(context.Context, *Constraints) (interface{}, error)
+	opts  []ConstraintsOpt
+	async *asyncState
 }
 
 func (s State) ensurePlatform() State {
 	if o, ok := s.out.(interface {
-		Platform() *specs.Platform
+		Platform() *ocispecs.Platform
 	}); ok {
 		if p := o.Platform(); p != nil {
 			s = platform(*p)(s)
@@ -57,14 +76,52 @@ func (s State) ensurePlatform() State {
 }
 
 func (s State) WithValue(k, v interface{}) State {
+	return s.withValue(k, func(context.Context, *Constraints) (interface{}, error) {
+		return v, nil
+	})
+}
+
+func (s State) withValue(k interface{}, v func(context.Context, *Constraints) (interface{}, error)) State {
 	return State{
-		out: s.out,
-		ctx: context.WithValue(s.ctx, k, v),
+		out:   s.Output(),
+		prev:  &s, // doesn't need to be original pointer
+		key:   k,
+		value: v,
 	}
 }
 
-func (s State) Value(k interface{}) interface{} {
-	return s.ctx.Value(k)
+func (s State) Value(ctx context.Context, k interface{}, co ...ConstraintsOpt) (interface{}, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return s.getValue(k)(ctx, c)
+}
+
+func (s State) getValue(k interface{}) func(context.Context, *Constraints) (interface{}, error) {
+	if s.key == k {
+		return s.value
+	}
+	if s.async != nil {
+		return func(ctx context.Context, c *Constraints) (interface{}, error) {
+			err := s.async.Do(ctx, c)
+			if err != nil {
+				return nil, err
+			}
+			return s.async.target.getValue(k)(ctx, c)
+		}
+	}
+	if s.prev == nil {
+		return nilValue
+	}
+	return s.prev.getValue(k)
+}
+
+func (s State) Async(f func(context.Context, State, *Constraints) (State, error)) State {
+	s2 := State{
+		async: &asyncState{f: f, prev: s},
+	}
+	return s2
 }
 
 func (s State) SetMarshalDefaults(co ...ConstraintsOpt) State {
@@ -72,28 +129,24 @@ func (s State) SetMarshalDefaults(co ...ConstraintsOpt) State {
 	return s
 }
 
-func (s State) Marshal(co ...ConstraintsOpt) (*Definition, error) {
+// Marshal marshals the state and all its parents into a [Definition].
+func (s State) Marshal(ctx context.Context, co ...ConstraintsOpt) (*Definition, error) {
+	c := NewConstraints(append(s.opts, co...)...)
 	def := &Definition{
-		Metadata: make(map[digest.Digest]pb.OpMetadata, 0),
+		Metadata:    make(map[digest.Digest]pb.OpMetadata, 0),
+		Constraints: c,
 	}
-	if s.Output() == nil {
+
+	if s.Output() == nil || s.Output().Vertex(ctx, c) == nil {
 		return def, nil
 	}
+	smc := newSourceMapCollector()
 
-	defaultPlatform := platforms.Normalize(platforms.DefaultSpec())
-	c := &Constraints{
-		Platform:      &defaultPlatform,
-		LocalUniqueID: identity.NewID(),
-	}
-	for _, o := range append(s.opts, co...) {
-		o.SetConstraintsOption(c)
-	}
-
-	def, err := marshal(s.Output().Vertex(), def, map[digest.Digest]struct{}{}, map[Vertex]struct{}{}, c)
+	def, err := marshal(ctx, s.Output().Vertex(ctx, c), def, smc, map[digest.Digest]struct{}{}, map[Vertex]struct{}{}, c)
 	if err != nil {
 		return def, err
 	}
-	inp, err := s.Output().ToInput(c)
+	inp, err := s.Output().ToInput(ctx, c)
 	if err != nil {
 		return def, err
 	}
@@ -124,23 +177,28 @@ func (s State) Marshal(co ...ConstraintsOpt) (*Definition, error) {
 	}
 
 	def.Metadata[dgst] = md
+	sm, err := smc.Marshal(ctx, co...)
+	if err != nil {
+		return nil, err
+	}
+	def.Source = sm
 
 	return def, nil
 }
 
-func marshal(v Vertex, def *Definition, cache map[digest.Digest]struct{}, vertexCache map[Vertex]struct{}, c *Constraints) (*Definition, error) {
+func marshal(ctx context.Context, v Vertex, def *Definition, s *sourceMapCollector, cache map[digest.Digest]struct{}, vertexCache map[Vertex]struct{}, c *Constraints) (*Definition, error) {
 	if _, ok := vertexCache[v]; ok {
 		return def, nil
 	}
 	for _, inp := range v.Inputs() {
 		var err error
-		def, err = marshal(inp.Vertex(), def, cache, vertexCache, c)
+		def, err = marshal(ctx, inp.Vertex(ctx, c), def, s, cache, vertexCache, c)
 		if err != nil {
 			return def, err
 		}
 	}
 
-	dgst, dt, opMeta, err := v.Marshal(c)
+	dgst, dt, opMeta, sls, err := v.Marshal(ctx, c)
 	if err != nil {
 		return def, err
 	}
@@ -148,6 +206,7 @@ func marshal(v Vertex, def *Definition, cache map[digest.Digest]struct{}, vertex
 	if opMeta != nil {
 		def.Metadata[dgst] = mergeMetadata(def.Metadata[dgst], *opMeta)
 	}
+	s.Add(dgst, sls)
 	if _, ok := cache[dgst]; ok {
 		return def, nil
 	}
@@ -156,31 +215,34 @@ func marshal(v Vertex, def *Definition, cache map[digest.Digest]struct{}, vertex
 	return def, nil
 }
 
-func (s State) Validate() error {
-	return s.Output().Vertex().Validate()
+// Validate validates the state.
+// This validation, unlike most other operations on [State], is not lazily performed.
+func (s State) Validate(ctx context.Context, c *Constraints) error {
+	return s.Output().Vertex(ctx, c).Validate(ctx, c)
 }
 
+// Output returns the output of the state.
 func (s State) Output() Output {
+	if s.async != nil {
+		return s.async.Output()
+	}
 	return s.out
 }
 
+// WithOutput creates a new state with the output set to the given output.
 func (s State) WithOutput(o Output) State {
+	prev := s
 	s = State{
-		out: o,
-		ctx: s.ctx,
+		out:  o,
+		prev: &prev,
 	}
 	s = s.ensurePlatform()
 	return s
 }
 
+// WithImageConfig adds the environment variables, working directory, and platform specified in the image config to the state.
 func (s State) WithImageConfig(c []byte) (State, error) {
-	var img struct {
-		Config struct {
-			Env        []string `json:"Env,omitempty"`
-			WorkingDir string   `json:"WorkingDir,omitempty"`
-			User       string   `json:"User,omitempty"`
-		} `json:"config,omitempty"`
-	}
+	var img ocispecs.Image
 	if err := json.Unmarshal(c, &img); err != nil {
 		return State{}, err
 	}
@@ -195,29 +257,33 @@ func (s State) WithImageConfig(c []byte) (State, error) {
 		}
 	}
 	s = s.Dir(img.Config.WorkingDir)
+	if img.Architecture != "" && img.OS != "" {
+		plat := ocispecs.Platform{
+			OS:           img.OS,
+			Architecture: img.Architecture,
+			Variant:      img.Variant,
+			OSVersion:    img.OSVersion,
+		}
+		if img.OSFeatures != nil {
+			plat.OSFeatures = append([]string{}, img.OSFeatures...)
+		}
+		s = s.Platform(plat)
+	}
 	return s, nil
 }
 
+// Run performs the command specified by the arguments within the context of the current [State].
+// The command is executed as a container with the [State]'s filesystem as the root filesystem.
+// As such any command you run must be present in the [State]'s filesystem.
+// Constraints such as [State.Ulimit], [State.ParentCgroup], [State.Network], etc. are applied to the container.
+//
+// Run is useful when none of the LLB ops are sufficient for the operation that you want to perform.
 func (s State) Run(ro ...RunOption) ExecState {
 	ei := &ExecInfo{State: s}
-	if p := s.GetPlatform(); p != nil {
-		ei.Constraints.Platform = p
-	}
 	for _, o := range ro {
 		o.SetRunOption(ei)
 	}
-	meta := Meta{
-		Args:       getArgs(ei.State),
-		Cwd:        getDir(ei.State),
-		Env:        getEnv(ei.State),
-		User:       getUser(ei.State),
-		ProxyEnv:   ei.ProxyEnv,
-		ExtraHosts: getExtraHosts(ei.State),
-		Network:    getNetwork(ei.State),
-		Security:   getSecurity(ei.State),
-	}
-
-	exec := NewExecOp(s.Output(), meta, ei.ReadonlyRootFS, ei.Constraints)
+	exec := NewExecOp(ei.State, ei.ProxyEnv, ei.ReadonlyRootFS, ei.Constraints)
 	for _, m := range ei.Mounts {
 		exec.AddMount(m.Target, m.Source, m.Opts...)
 	}
@@ -230,6 +296,8 @@ func (s State) Run(ro ...RunOption) ExecState {
 	}
 }
 
+// File performs a file operation on the current state.
+// See [FileAction] for details on the operations that can be performed.
 func (s State) File(a *FileAction, opts ...ConstraintsOpt) State {
 	var c Constraints
 	for _, o := range opts {
@@ -239,68 +307,153 @@ func (s State) File(a *FileAction, opts ...ConstraintsOpt) State {
 	return s.WithOutput(NewFileOp(s, a, c).Output())
 }
 
+// AddEnv returns a new [State] with the provided environment variable set.
+// See [AddEnv]
 func (s State) AddEnv(key, value string) State {
-	return s.AddEnvf(key, value)
+	return AddEnv(key, value)(s)
 }
 
+// AddEnvf is the same as [State.AddEnv] but with a format string.
 func (s State) AddEnvf(key, value string, v ...interface{}) State {
-	return addEnvf(key, value, v...)(s)
+	return AddEnvf(key, value, v...)(s)
 }
 
+// Dir returns a new [State] with the provided working directory set.
+// See [Dir]
 func (s State) Dir(str string) State {
-	return s.Dirf(str)
+	return Dir(str)(s)
 }
+
+// Dirf is the same as [State.Dir] but with a format string.
 func (s State) Dirf(str string, v ...interface{}) State {
-	return dirf(str, v...)(s)
+	return Dirf(str, v...)(s)
 }
 
-func (s State) GetEnv(key string) (string, bool) {
-	return getEnv(s).Get(key)
+// GetEnv returns the value of the environment variable with the provided key.
+func (s State) GetEnv(ctx context.Context, key string, co ...ConstraintsOpt) (string, bool, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	env, err := getEnv(s)(ctx, c)
+	if err != nil {
+		return "", false, err
+	}
+	v, ok := env.Get(key)
+	return v, ok, nil
 }
 
-func (s State) Env() []string {
-	return getEnv(s).ToArray()
+// Env returns a new [State] with the provided environment variable set.
+// See [Env]
+func (s State) Env(ctx context.Context, co ...ConstraintsOpt) ([]string, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	env, err := getEnv(s)(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return env.ToArray(), nil
 }
 
-func (s State) GetDir() string {
-	return getDir(s)
+// GetDir returns the current working directory for the state.
+func (s State) GetDir(ctx context.Context, co ...ConstraintsOpt) (string, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getDir(s)(ctx, c)
 }
 
-func (s State) GetArgs() []string {
-	return getArgs(s)
+func (s State) GetArgs(ctx context.Context, co ...ConstraintsOpt) ([]string, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getArgs(s)(ctx, c)
 }
 
+// Reset is used to return a new [State] with all of the current state and the
+// provided [State] as the parent. In effect you can think of this as creating
+// a new state with all the output from the current state but reparented to the
+// provided state.  See [Reset] for more details.
 func (s State) Reset(s2 State) State {
-	return reset(s2)(s)
+	return Reset(s2)(s)
 }
 
+// User sets the user for this state.
+// See [User] for more details.
 func (s State) User(v string) State {
-	return user(v)(s)
+	return User(v)(s)
 }
 
-func (s State) Platform(p specs.Platform) State {
+// Hostname sets the hostname for this state.
+// See [Hostname] for more details.
+func (s State) Hostname(v string) State {
+	return Hostname(v)(s)
+}
+
+// GetHostname returns the hostname set on the state.
+// See [Hostname] for more details.
+func (s State) GetHostname(ctx context.Context, co ...ConstraintsOpt) (string, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getHostname(s)(ctx, c)
+}
+
+// Platform sets the platform for the state. Platforms are used to determine
+// image variants to pull and run as well as the platform metadata to set on the
+// image config.
+func (s State) Platform(p ocispecs.Platform) State {
 	return platform(p)(s)
 }
 
-func (s State) GetPlatform() *specs.Platform {
-	return getPlatform(s)
+// GetPlatform returns the platform for the state.
+func (s State) GetPlatform(ctx context.Context, co ...ConstraintsOpt) (*ocispecs.Platform, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getPlatform(s)(ctx, c)
 }
 
+// Network sets the network mode for the state.
+// Network modes are used by [State.Run] to determine the network mode used when running the container.
+// Network modes are not applied to image configs.
 func (s State) Network(n pb.NetMode) State {
-	return network(n)(s)
+	return Network(n)(s)
 }
 
-func (s State) GetNetwork() pb.NetMode {
-	return getNetwork(s)
+// GetNetwork returns the network mode for the state.
+func (s State) GetNetwork(ctx context.Context, co ...ConstraintsOpt) (pb.NetMode, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getNetwork(s)(ctx, c)
 }
+
+// Security sets the security mode for the state.
+// Security modes are used by [State.Run] to the privileges that processes in the container will run with.
+// Security modes are not applied to image configs.
 func (s State) Security(n pb.SecurityMode) State {
-	return security(n)(s)
+	return Security(n)(s)
 }
 
-func (s State) GetSecurity() pb.SecurityMode {
-	return getSecurity(s)
+// GetSecurity returns the security mode for the state.
+func (s State) GetSecurity(ctx context.Context, co ...ConstraintsOpt) (pb.SecurityMode, error) {
+	c := &Constraints{}
+	for _, f := range co {
+		f.SetConstraintsOption(c)
+	}
+	return getSecurity(s)(ctx, c)
 }
 
+// With applies [StateOption]s to the [State].
+// Each applied [StateOption] creates a new [State] object with the previous as its parent.
 func (s State) With(so ...StateOption) State {
 	for _, o := range so {
 		s = o(s)
@@ -308,8 +461,25 @@ func (s State) With(so ...StateOption) State {
 	return s
 }
 
+// AddExtraHost adds a host name to IP mapping to any containers created from this state.
 func (s State) AddExtraHost(host string, ip net.IP) State {
 	return extraHost(host, ip)(s)
+}
+
+// AddUlimit sets the hard/soft for the given ulimit.
+// The ulimit is applied to containers created from this state.
+// Ulimits are Linux specific and only applies to containers created from this state such as via `[State.Run]`
+// Ulimits do not apply to image configs.
+func (s State) AddUlimit(name UlimitName, soft int64, hard int64) State {
+	return ulimit(name, soft, hard)(s)
+}
+
+// WithCgroupParent sets the parent cgroup for any containers created from this state.
+// This is useful when you want to apply resource constraints to a group of containers.
+// Cgroups are Linux specific and only applies to containers created from this state such as via `[State.Run]`
+// Cgroups do not apply to image configs.
+func (s State) WithCgroupParent(cp string) State {
+	return cgroupParent(cp)(s)
 }
 
 func (s State) isFileOpCopyInput() {}
@@ -318,10 +488,10 @@ type output struct {
 	vertex   Vertex
 	getIndex func() (pb.OutputIndex, error)
 	err      error
-	platform *specs.Platform
+	platform *ocispecs.Platform
 }
 
-func (o *output) ToInput(c *Constraints) (*pb.Input, error) {
+func (o *output) ToInput(ctx context.Context, c *Constraints) (*pb.Input, error) {
 	if o.err != nil {
 		return nil, o.err
 	}
@@ -333,18 +503,18 @@ func (o *output) ToInput(c *Constraints) (*pb.Input, error) {
 			return nil, err
 		}
 	}
-	dgst, _, _, err := o.vertex.Marshal(c)
+	dgst, _, _, _, err := o.vertex.Marshal(ctx, c)
 	if err != nil {
 		return nil, err
 	}
 	return &pb.Input{Digest: dgst, Index: index}, nil
 }
 
-func (o *output) Vertex() Vertex {
+func (o *output) Vertex(context.Context, *Constraints) Vertex {
 	return o.vertex
 }
 
-func (o *output) Platform() *specs.Platform {
+func (o *output) Platform() *ocispecs.Platform {
 	return o.platform
 }
 
@@ -355,6 +525,7 @@ type ConstraintsOpt interface {
 	HTTPOption
 	ImageOption
 	GitOption
+	OCILayoutOption
 }
 
 type constraintsOptFunc func(m *Constraints)
@@ -369,6 +540,10 @@ func (fn constraintsOptFunc) SetRunOption(ei *ExecInfo) {
 
 func (fn constraintsOptFunc) SetLocalOption(li *LocalInfo) {
 	li.applyConstraints(fn)
+}
+
+func (fn constraintsOptFunc) SetOCILayoutOption(oi *OCILayoutInfo) {
+	oi.applyConstraints(fn)
 }
 
 func (fn constraintsOptFunc) SetHTTPOption(hi *HTTPInfo) {
@@ -404,6 +579,10 @@ func mergeMetadata(m1, m2 pb.OpMetadata) pb.OpMetadata {
 			m1.Caps = make(map[apicaps.CapID]bool, len(m2.Caps))
 		}
 		m1.Caps[k] = true
+	}
+
+	if m2.ProgressGroup != nil {
+		m1.ProgressGroup = m2.ProgressGroup
 	}
 
 	return m1
@@ -475,14 +654,15 @@ func (cw *constraintsWrapper) applyConstraints(f func(c *Constraints)) {
 }
 
 type Constraints struct {
-	Platform          *specs.Platform
+	Platform          *ocispecs.Platform
 	WorkerConstraints []string
 	Metadata          pb.OpMetadata
 	LocalUniqueID     string
 	Caps              *apicaps.CapSet
+	SourceLocations   []*SourceLocation
 }
 
-func Platform(p specs.Platform) ConstraintsOpt {
+func Platform(p ocispecs.Platform) ConstraintsOpt {
 	return constraintsOptFunc(func(c *Constraints) {
 		c.Platform = &p
 	})
@@ -494,22 +674,31 @@ func LocalUniqueID(v string) ConstraintsOpt {
 	})
 }
 
+func ProgressGroup(id, name string, weak bool) ConstraintsOpt {
+	return constraintsOptFunc(func(c *Constraints) {
+		c.Metadata.ProgressGroup = &pb.ProgressGroup{Id: id, Name: name, Weak: weak}
+	})
+}
+
 var (
-	LinuxAmd64   = Platform(specs.Platform{OS: "linux", Architecture: "amd64"})
-	LinuxArmhf   = Platform(specs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"})
+	LinuxAmd64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "amd64"})
+	LinuxArmhf   = Platform(ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v7"})
 	LinuxArm     = LinuxArmhf
-	LinuxArmel   = Platform(specs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"})
-	LinuxArm64   = Platform(specs.Platform{OS: "linux", Architecture: "arm64"})
-	LinuxS390x   = Platform(specs.Platform{OS: "linux", Architecture: "s390x"})
-	LinuxPpc64le = Platform(specs.Platform{OS: "linux", Architecture: "ppc64le"})
-	Darwin       = Platform(specs.Platform{OS: "darwin", Architecture: "amd64"})
-	Windows      = Platform(specs.Platform{OS: "windows", Architecture: "amd64"})
+	LinuxArmel   = Platform(ocispecs.Platform{OS: "linux", Architecture: "arm", Variant: "v6"})
+	LinuxArm64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "arm64"})
+	LinuxS390x   = Platform(ocispecs.Platform{OS: "linux", Architecture: "s390x"})
+	LinuxPpc64   = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64"})
+	LinuxPpc64le = Platform(ocispecs.Platform{OS: "linux", Architecture: "ppc64le"})
+	Darwin       = Platform(ocispecs.Platform{OS: "darwin", Architecture: "amd64"})
+	Windows      = Platform(ocispecs.Platform{OS: "windows", Architecture: "amd64"})
 )
 
 func Require(filters ...string) ConstraintsOpt {
 	return constraintsOptFunc(func(c *Constraints) {
-		for _, f := range filters {
-			c.WorkerConstraints = append(c.WorkerConstraints, f)
-		}
+		c.WorkerConstraints = append(c.WorkerConstraints, filters...)
 	})
+}
+
+func nilValue(context.Context, *Constraints) (interface{}, error) {
+	return nil, nil
 }

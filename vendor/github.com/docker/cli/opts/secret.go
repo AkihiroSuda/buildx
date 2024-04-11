@@ -27,12 +27,12 @@ func (o *SecretOpt) Set(value string) error {
 		File: &swarmtypes.SecretReferenceFileTarget{
 			UID:  "0",
 			GID:  "0",
-			Mode: 0444,
+			Mode: 0o444,
 		},
 	}
 
 	// support a simple syntax of --secret foo
-	if len(fields) == 1 {
+	if len(fields) == 1 && !strings.Contains(fields[0], "=") {
 		options.File.Name = fields[0]
 		options.SecretName = fields[0]
 		o.values = append(o.values, options)
@@ -40,25 +40,22 @@ func (o *SecretOpt) Set(value string) error {
 	}
 
 	for _, field := range fields {
-		parts := strings.SplitN(field, "=", 2)
-		key := strings.ToLower(parts[0])
-
-		if len(parts) != 2 {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok || key == "" {
 			return fmt.Errorf("invalid field '%s' must be a key=value pair", field)
 		}
-
-		value := parts[1]
-		switch key {
+		// TODO(thaJeztah): these options should not be case-insensitive.
+		switch strings.ToLower(key) {
 		case "source", "src":
-			options.SecretName = value
+			options.SecretName = val
 		case "target":
-			options.File.Name = value
+			options.File.Name = val
 		case "uid":
-			options.File.UID = value
+			options.File.UID = val
 		case "gid":
-			options.File.GID = value
+			options.File.GID = val
 		case "mode":
-			m, err := strconv.ParseUint(value, 0, 32)
+			m, err := strconv.ParseUint(val, 0, 32)
 			if err != nil {
 				return fmt.Errorf("invalid mode specified: %v", err)
 			}
@@ -71,6 +68,9 @@ func (o *SecretOpt) Set(value string) error {
 
 	if options.SecretName == "" {
 		return fmt.Errorf("source is required")
+	}
+	if options.File.Name == "" {
+		options.File.Name = options.SecretName
 	}
 
 	o.values = append(o.values, options)

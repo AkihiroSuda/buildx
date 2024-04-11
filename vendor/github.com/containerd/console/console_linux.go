@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -58,6 +59,7 @@ type Epoller struct {
 	efd       int
 	mu        sync.Mutex
 	fdMapping map[int]*EpollConsole
+	closeOnce sync.Once
 }
 
 // NewEpoller returns an instance of epoller with a valid epoll fd.
@@ -151,7 +153,11 @@ func (e *Epoller) getConsole(sysfd int) *EpollConsole {
 
 // Close closes the epoll fd
 func (e *Epoller) Close() error {
-	return unix.Close(e.efd)
+	closeErr := os.ErrClosed // default to "file already closed"
+	e.closeOnce.Do(func() {
+		closeErr = unix.Close(e.efd)
+	})
+	return closeErr
 }
 
 // EpollConsole acts like a console but registers its file descriptor with an

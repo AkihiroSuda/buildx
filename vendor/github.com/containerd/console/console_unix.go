@@ -1,4 +1,5 @@
-// +build darwin freebsd linux openbsd solaris
+//go:build darwin || freebsd || linux || netbsd || openbsd || zos
+// +build darwin freebsd linux netbsd openbsd zos
 
 /*
    Copyright The containerd Authors.
@@ -19,8 +20,6 @@
 package console
 
 import (
-	"os"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -28,7 +27,7 @@ import (
 // The master is returned as the first console and a string
 // with the path to the pty slave is returned as the second
 func NewPty() (Console, string, error) {
-	f, err := os.OpenFile("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	f, err := openpt()
 	if err != nil {
 		return nil, "", err
 	}
@@ -47,7 +46,7 @@ func NewPty() (Console, string, error) {
 }
 
 type master struct {
-	f        *os.File
+	f        File
 	original *unix.Termios
 }
 
@@ -122,7 +121,7 @@ func (m *master) Name() string {
 }
 
 // checkConsole checks if the provided file is a console
-func checkConsole(f *os.File) error {
+func checkConsole(f File) error {
 	var termios unix.Termios
 	if tcget(f.Fd(), &termios) != nil {
 		return ErrNotAConsole
@@ -130,7 +129,7 @@ func checkConsole(f *os.File) error {
 	return nil
 }
 
-func newMaster(f *os.File) (Console, error) {
+func newMaster(f File) (Console, error) {
 	m := &master{
 		f: f,
 	}

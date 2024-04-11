@@ -4,7 +4,9 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"syscall"
 
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil/types"
@@ -13,7 +15,8 @@ import (
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 32*1<<10)
+		buf := make([]byte, 32*1<<10)
+		return &buf
 	},
 }
 
@@ -40,13 +43,14 @@ type sendHandle struct {
 }
 
 type sender struct {
-	conn            Stream
-	fs              FS
-	files           map[uint32]string
-	mu              sync.RWMutex
-	progressCb      func(int, bool)
-	progressCurrent int
-	sendpipeline    chan *sendHandle
+	conn              Stream
+	fs                FS
+	files             map[uint32]string
+	mu                sync.RWMutex
+	progressCb        func(int, bool)
+	progressCurrent   int
+	progressCurrentMu sync.Mutex
+	sendpipeline      chan *sendHandle
 }
 
 func (s *sender) run(ctx context.Context) error {
@@ -109,6 +113,8 @@ func (s *sender) run(ctx context.Context) error {
 
 func (s *sender) updateProgress(size int, last bool) {
 	if s.progressCb != nil {
+		s.progressCurrentMu.Lock()
+		defer s.progressCurrentMu.Unlock()
 		s.progressCurrent += size
 		s.progressCb(s.progressCurrent, last)
 	}
@@ -131,9 +137,9 @@ func (s *sender) sendFile(h *sendHandle) error {
 	f, err := s.fs.Open(h.path)
 	if err == nil {
 		defer f.Close()
-		buf := bufPool.Get().([]byte)
+		buf := bufPool.Get().(*[]byte)
 		defer bufPool.Put(buf)
-		if _, err := io.CopyBuffer(&fileSender{sender: s, id: h.id}, f, buf); err != nil {
+		if _, err := io.CopyBuffer(&fileSender{sender: s, id: h.id}, struct{ io.Reader }{f}, *buf); err != nil {
 			return err
 		}
 	}
@@ -142,15 +148,19 @@ func (s *sender) sendFile(h *sendHandle) error {
 
 func (s *sender) walk(ctx context.Context) error {
 	var i uint32 = 0
-	err := s.fs.Walk(ctx, func(path string, fi os.FileInfo, err error) error {
+	err := s.fs.Walk(ctx, "/", func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		fi, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		stat, ok := fi.Sys().(*types.Stat)
 		if !ok {
-			return errors.Wrapf(err, "invalid fileinfo without stat info: %s", path)
+			return errors.WithStack(&os.PathError{Path: path, Err: syscall.EBADMSG, Op: "fileinfo without stat info"})
 		}
-
+		stat.Path = filepath.ToSlash(stat.Path)
 		p := &types.Packet{
 			Type: types.PACKET_STAT,
 			Stat: stat,

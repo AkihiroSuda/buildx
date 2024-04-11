@@ -1,67 +1,131 @@
-# syntax=docker/dockerfile:1.0-experimental
+# syntax=docker/dockerfile:1
 
-ARG DOCKERD_VERSION=19.03-rc
-ARG CLI_VERSION=19.03
+ARG GO_VERSION=1.21
+ARG XX_VERSION=1.4.0
 
-FROM docker:$DOCKERD_VERSION AS dockerd-release
+# for testing
+ARG DOCKER_VERSION=26.0.0
+ARG GOTESTSUM_VERSION=v1.9.0
+ARG REGISTRY_VERSION=2.8.0
+ARG BUILDKIT_VERSION=v0.13.1
+ARG UNDOCK_VERSION=0.7.0
 
-# xgo is a helper for golang cross-compilation
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:golang@sha256:6f7d999551dd471b58f70716754290495690efa8421e0a1fcf18eb11d0c0a537 AS xgo
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS golatest
+FROM moby/moby-bin:$DOCKER_VERSION AS docker-engine
+FROM dockereng/cli-bin:$DOCKER_VERSION AS docker-cli
+FROM registry:$REGISTRY_VERSION AS registry
+FROM moby/buildkit:$BUILDKIT_VERSION AS buildkit
+FROM crazymax/undock:$UNDOCK_VERSION AS undock
 
-FROM --platform=$BUILDPLATFORM golang:1.12-alpine AS gobase
-COPY --from=xgo / /
+FROM golatest AS gobase
+COPY --from=xx / /
 RUN apk add --no-cache file git
 ENV GOFLAGS=-mod=vendor
+ENV CGO_ENABLED=0
 WORKDIR /src
 
+FROM gobase AS gotestsum
+ARG GOTESTSUM_VERSION
+ENV GOFLAGS=
+RUN --mount=target=/root/.cache,type=cache \
+  GOBIN=/out/ go install "gotest.tools/gotestsum@${GOTESTSUM_VERSION}" && \
+  /out/gotestsum --version
+
 FROM gobase AS buildx-version
-RUN --mount=target=. \
-  PKG=github.com/tonistiigi/buildx VERSION=$(git describe --match 'v[0-9]*' --dirty='.m' --always --tags) REVISION=$(git rev-parse HEAD)$(if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi); \
-  echo "-X ${PKG}/version.Version=${VERSION} -X ${PKG}/version.Revision=${REVISION} -X ${PKG}/version.Package=${PKG}" | tee /tmp/.ldflags; \
-  echo -n "${VERSION}" | tee /tmp/.version;
+RUN --mount=type=bind,target=. <<EOT
+  set -e
+  mkdir /buildx-version
+  echo -n "$(./hack/git-meta version)" | tee /buildx-version/version
+  echo -n "$(./hack/git-meta revision)" | tee /buildx-version/revision
+EOT
 
 FROM gobase AS buildx-build
-ENV CGO_ENABLED=0
 ARG TARGETPLATFORM
-RUN --mount=target=. --mount=target=/root/.cache,type=cache \
-  --mount=target=/go/pkg/mod,type=cache \
-  --mount=source=/tmp/.ldflags,target=/tmp/.ldflags,from=buildx-version \
-  set -x; go build -ldflags "$(cat /tmp/.ldflags)" -o /usr/bin/buildx ./cmd/buildx && \
-  file /usr/bin/buildx && file /usr/bin/buildx | egrep "statically linked|Mach-O|Windows"
+RUN --mount=type=bind,target=. \
+  --mount=type=cache,target=/root/.cache \
+  --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=bind,from=buildx-version,source=/buildx-version,target=/buildx-version <<EOT
+  set -e
+  xx-go --wrap
+  DESTDIR=/usr/bin VERSION=$(cat /buildx-version/version) REVISION=$(cat /buildx-version/revision) GO_EXTRA_LDFLAGS="-s -w" ./hack/build
+  xx-verify --static /usr/bin/docker-buildx
+EOT
 
-FROM buildx-build AS integration-tests
-COPY . .
+FROM gobase AS test
+ENV SKIP_INTEGRATION_TESTS=1
+RUN --mount=type=bind,target=. \
+  --mount=type=cache,target=/root/.cache \
+  --mount=type=cache,target=/go/pkg/mod \
+  go test -v -coverprofile=/tmp/coverage.txt -covermode=atomic ./... && \
+  go tool cover -func=/tmp/coverage.txt
 
-FROM golang:1.12-alpine AS docker-cli-build
-RUN apk add -U git bash coreutils gcc musl-dev
-ENV CGO_ENABLED=0
-ARG REPO=github.com/docker/cli
-ARG CLI_VERSION
-WORKDIR /go/src/github.com/docker/cli
-RUN git clone git://$REPO . && git checkout $BRANCH
-RUN ./scripts/build/binary
+FROM scratch AS test-coverage
+COPY --from=test /tmp/coverage.txt /coverage.txt
 
 FROM scratch AS binaries-unix
-COPY --from=buildx-build /usr/bin/buildx /
+COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx
 
 FROM binaries-unix AS binaries-darwin
 FROM binaries-unix AS binaries-linux
 
 FROM scratch AS binaries-windows
-COPY --from=buildx-build /usr/bin/buildx /buildx.exe
+COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx.exe
 
 FROM binaries-$TARGETOS AS binaries
+# enable scanning for this stage
+ARG BUILDKIT_SBOM_SCAN_STAGE=true
 
-FROM alpine AS demo-env
-RUN apk add --no-cache iptables tmux git vim less
+FROM gobase AS integration-test-base
+# https://github.com/docker/docker/blob/master/project/PACKAGERS.md#runtime-dependencies
+RUN apk add --no-cache \
+      btrfs-progs \
+      e2fsprogs \
+      e2fsprogs-extra \
+      ip6tables \
+      iptables \
+      openssl \
+      shadow-uidmap \
+      xfsprogs \
+      xz
+COPY --link --from=gotestsum /out/gotestsum /usr/bin/
+COPY --link --from=registry /bin/registry /usr/bin/
+COPY --link --from=docker-engine / /usr/bin/
+COPY --link --from=docker-cli / /usr/bin/
+COPY --link --from=buildkit /usr/bin/buildkitd /usr/bin/
+COPY --link --from=buildkit /usr/bin/buildctl /usr/bin/
+COPY --link --from=undock /usr/local/bin/undock /usr/bin/
+COPY --link --from=binaries /buildx /usr/bin/
+
+FROM integration-test-base AS integration-test
+COPY . .
+
+# Release
+FROM --platform=$BUILDPLATFORM alpine AS releaser
+WORKDIR /work
+ARG TARGETPLATFORM
+RUN --mount=from=binaries \
+  --mount=type=bind,from=buildx-version,source=/buildx-version,target=/buildx-version <<EOT
+  set -e
+  mkdir -p /out
+  cp buildx* "/out/buildx-$(cat /buildx-version/version).$(echo $TARGETPLATFORM | sed 's/\//-/g')$(ls buildx* | sed -e 's/^buildx//')"
+EOT
+
+FROM scratch AS release
+COPY --from=releaser /out/ /
+
+# Shell
+FROM docker:$DOCKER_VERSION AS dockerd-release
+FROM alpine AS shell
+RUN apk add --no-cache iptables tmux git vim less openssh
 RUN mkdir -p /usr/local/lib/docker/cli-plugins && ln -s /usr/local/bin/buildx /usr/local/lib/docker/cli-plugins/docker-buildx
 COPY ./hack/demo-env/entrypoint.sh /usr/local/bin
 COPY ./hack/demo-env/tmux.conf /root/.tmux.conf
 COPY --from=dockerd-release /usr/local/bin /usr/local/bin
-#COPY --from=docker-cli-build /go/src/github.com/docker/cli/build/docker /usr/local/bin
-
 WORKDIR /work
 COPY ./hack/demo-env/examples .
 COPY --from=binaries / /usr/local/bin/
 VOLUME /var/lib/docker
 ENTRYPOINT ["entrypoint.sh"]
+
+FROM binaries

@@ -32,6 +32,9 @@ type Manager interface {
 	Create(context.Context, ...Opt) (Lease, error)
 	Delete(context.Context, Lease, ...DeleteOpt) error
 	List(context.Context, ...string) ([]Lease, error)
+	AddResource(context.Context, Lease, Resource) error
+	DeleteResource(context.Context, Lease, Resource) error
+	ListResources(context.Context, Lease) ([]Resource, error)
 }
 
 // Lease retains resources to prevent cleanup before
@@ -40,6 +43,13 @@ type Lease struct {
 	ID        string
 	CreatedAt time.Time
 	Labels    map[string]string
+}
+
+// Resource represents low level resource of image, like content, ingest and
+// snapshotter.
+type Resource struct {
+	ID   string
+	Type string
 }
 
 // DeleteOptions provide options on image delete
@@ -55,10 +65,15 @@ func SynchronousDelete(ctx context.Context, o *DeleteOptions) error {
 	return nil
 }
 
-// WithLabels sets labels on a lease
+// WithLabels merges labels on a lease
 func WithLabels(labels map[string]string) Opt {
 	return func(l *Lease) error {
-		l.Labels = labels
+		if l.Labels == nil {
+			l.Labels = map[string]string{}
+		}
+		for k, v := range labels {
+			l.Labels[k] = v
+		}
 		return nil
 	}
 }

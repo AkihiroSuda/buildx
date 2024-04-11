@@ -2,11 +2,16 @@ package driver
 
 import (
 	"context"
-	"time"
+	"io"
+	"net"
+	"strings"
 
+	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/util/progress"
+	clitypes "github.com/docker/cli/cli/config/types"
+	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
-	"github.com/tonistiigi/buildx/util/progress"
 )
 
 var ErrNotRunning = errors.Errorf("driver not running")
@@ -40,110 +45,85 @@ func (s Status) String() string {
 
 type Info struct {
 	Status Status
+	// DynamicNodes must be empty if the actual nodes are statically listed in the store
+	DynamicNodes []store.Node
+}
+
+type Auth interface {
+	GetAuthConfig(registryHostname string) (clitypes.AuthConfig, error)
 }
 
 type Driver interface {
 	Factory() Factory
 	Bootstrap(context.Context, progress.Logger) error
 	Info(context.Context) (*Info, error)
+	Version(context.Context) (string, error)
 	Stop(ctx context.Context, force bool) error
-	Rm(ctx context.Context, force bool) error
-	Client(ctx context.Context) (*client.Client, error)
-	Features() map[Feature]bool
+	Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error
+	Dial(ctx context.Context) (net.Conn, error)
+	Client(ctx context.Context, opts ...client.ClientOpt) (*client.Client, error)
+	Features(ctx context.Context) map[Feature]bool
+	HostGatewayIP(ctx context.Context) (net.IP, error)
+	IsMobyDriver() bool
+	Config() InitConfig
 }
 
-func Boot(ctx context.Context, d Driver, pw progress.Writer) (*client.Client, progress.Writer, error) {
+const builderNamePrefix = "buildx_buildkit_"
+
+func BuilderName(name string) string {
+	return builderNamePrefix + name
+}
+
+func ParseBuilderName(name string) (string, error) {
+	if !strings.HasPrefix(name, builderNamePrefix) {
+		return "", errors.Errorf("invalid builder name %q, must have %q prefix", name, builderNamePrefix)
+	}
+	return strings.TrimPrefix(name, builderNamePrefix), nil
+}
+
+func Boot(ctx, clientContext context.Context, d *DriverHandle, pw progress.Writer) (*client.Client, error) {
 	try := 0
 	for {
 		info, err := d.Info(ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		try++
 		if info.Status != Running {
 			if try > 2 {
-				return nil, nil, errors.Errorf("failed to bootstrap %T driver in attempts", d)
+				return nil, errors.Errorf("failed to bootstrap %T driver in attempts", d)
 			}
-			if err := d.Bootstrap(ctx, func(s *client.SolveStatus) {
-				if pw != nil {
-					pw.Status() <- s
-				}
-			}); err != nil {
-				return nil, nil, err
+			if err := d.Bootstrap(ctx, pw.Write); err != nil {
+				return nil, err
 			}
 		}
 
-		c, err := d.Client(ctx)
+		c, err := d.Client(clientContext)
 		if err != nil {
 			if errors.Cause(err) == ErrNotRunning && try <= 2 {
 				continue
 			}
-			return nil, nil, err
+			return nil, err
 		}
-		return c, newResetWriter(pw), nil
+		return c, nil
 	}
 }
 
-func newResetWriter(in progress.Writer) progress.Writer {
-	w := &pw{Writer: in, status: make(chan *client.SolveStatus), tm: time.Now()}
-	go func() {
-		for {
-			select {
-			case <-in.Done():
-				return
-			case st, ok := <-w.status:
-				if !ok {
-					close(in.Status())
-					return
-				}
-				if w.diff == nil {
-					for _, v := range st.Vertexes {
-						if v.Started != nil {
-							d := v.Started.Sub(w.tm)
-							w.diff = &d
-						}
-					}
-				}
-				if w.diff != nil {
-					for _, v := range st.Vertexes {
-						if v.Started != nil {
-							d := v.Started.Add(-*w.diff)
-							v.Started = &d
-						}
-						if v.Completed != nil {
-							d := v.Completed.Add(-*w.diff)
-							v.Completed = &d
-						}
-					}
-					for _, v := range st.Statuses {
-						if v.Started != nil {
-							d := v.Started.Add(-*w.diff)
-							v.Started = &d
-						}
-						if v.Completed != nil {
-							d := v.Completed.Add(-*w.diff)
-							v.Completed = &d
-						}
-						v.Timestamp = v.Timestamp.Add(-*w.diff)
-					}
-					for _, v := range st.Logs {
-						v.Timestamp = v.Timestamp.Add(-*w.diff)
-					}
-				}
-				in.Status() <- st
-			}
+func historyAPISupported(ctx context.Context, c *client.Client) bool {
+	cl, err := c.ControlClient().ListenBuildHistory(ctx, &controlapi.BuildHistoryRequest{
+		ActiveOnly: true,
+		Ref:        "buildx-test-history-api-feature", // dummy ref to check if the server supports the API
+		EarlyExit:  true,
+	})
+	if err != nil {
+		return false
+	}
+	for {
+		_, err := cl.Recv()
+		if errors.Is(err, io.EOF) {
+			return true
+		} else if err != nil {
+			return false
 		}
-	}()
-	return w
-}
-
-type pw struct {
-	progress.Writer
-	tm     time.Time
-	diff   *time.Duration
-	status chan *client.SolveStatus
-}
-
-func (p *pw) Status() chan *client.SolveStatus {
-	return p.status
+	}
 }

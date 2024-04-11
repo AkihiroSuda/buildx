@@ -1,3 +1,6 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.19
+
 package manager
 
 import (
@@ -25,6 +28,11 @@ func (e *pluginError) Cause() error {
 	return e.cause
 }
 
+// Unwrap provides compatibility for Go 1.13 error chains.
+func (e *pluginError) Unwrap() error {
+	return e.cause
+}
+
 // MarshalText marshalls the pluginError into a textual form.
 func (e *pluginError) MarshalText() (text []byte, err error) {
 	return []byte(e.cause.Error()), nil
@@ -33,11 +41,14 @@ func (e *pluginError) MarshalText() (text []byte, err error) {
 // wrapAsPluginError wraps an error in a pluginError with an
 // additional message, analogous to errors.Wrapf.
 func wrapAsPluginError(err error, msg string) error {
+	if err == nil {
+		return nil
+	}
 	return &pluginError{cause: errors.Wrap(err, msg)}
 }
 
 // NewPluginError creates a new pluginError, analogous to
 // errors.Errorf.
-func NewPluginError(msg string, args ...interface{}) error {
+func NewPluginError(msg string, args ...any) error {
 	return &pluginError{cause: errors.Errorf(msg, args...)}
 }
